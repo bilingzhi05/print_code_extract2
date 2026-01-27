@@ -111,16 +111,16 @@ def construct_prompt(batch_items):
     """
     return prompt
 
-def call_llm(prompt, retry=3):
+def call_llm(prompt, retry=3, model="qwen3:8b-q8_0", temperature=0.3, top_p=0.3, ctx_num=8192):
     log(f"prompt: {prompt}")
     payload = {
-        "model": MODEL,
+        "model": model,
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.3,
-            "top_p": 0.3,
-            "num_ctx": 8192 
+            "temperature": temperature,
+            "top_p": top_p,
+            "num_ctx": ctx_num 
         }
     }
     

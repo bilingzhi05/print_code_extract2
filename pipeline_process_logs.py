@@ -12,16 +12,17 @@ import clean_log_text
 import deduplicate_csv
 import llm_analyze_logs
 import extract_and_convert_logs
+import extract_log_print_patterns
 from logger import log
 import time
+PROJECT = "audiohal" 
+SOURCE_DIR = "/home/bj17300-049u/work/audiohal_wraper/audio_hal"
 
-def main():
+def run_extract_log_pipeline():
     log("Starting log processing pipeline...")
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     # --- Configuration ---
-    PROJECT = "audiohal"
     
-    SOURCE_DIR = "/home/bj17300-049u/work/audiohal_wraper/audio_hal"
     # Add current directory to sys.path
     current_dir = os.path.dirname(os.path.abspath(SOURCE_DIR))
     log(f"Current directory: {current_dir}")
@@ -55,6 +56,9 @@ def main():
     # --- Step 1: Extract Logs from Source ---
     log(f"\n[Step 1] Extracting logs from {SOURCE_DIR} to {FILE_STEP_1}...")
     try:
+        # Extract log print patterns
+        extract_log_print_patterns.SOURCE_DIR = SOURCE_DIR
+        extract_log_print_patterns.extract_log_print_patterns_to_file()
         extract_log.PATTERN_FILE = os.path.join(current_dir, "extracted_log_print_patterns.txt")
         patterns, starters = extract_log.build_patterns()
         rows = extract_log.walk_root(SOURCE_DIR, patterns, starters)
@@ -129,4 +133,4 @@ def main():
     log(f"Final Regex File: {FILE_STEP_6_REGEX}")
 
 if __name__ == "__main__":
-    main()
+    run_extract_log_pipeline()
