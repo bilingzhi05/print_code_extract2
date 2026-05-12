@@ -2,17 +2,19 @@ import re
 import os
 import subprocess
 import json
-from logger import log
-from llm_analyze_logs import call_llm
+import shutil
+from utils.logger import log
+from utils.agent import ImpAgent
 
 INPUT_FILE = "/home/bj17300-049u/work/audiohal_wraper/log_print.txt"
 OUTPUT_FILE = "/home/bj17300-049u/work/audiohal_wraper/extracted_log_print_patterns.txt"
 SOURCE_DIR = "/home/bj17300-049u/work/audiohal_wraper/audio_hal"
+llm_agent = ImpAgent()
 
 
 def extract_patterns(log_print_file):
     if not os.path.exists(log_print_file):
-        print(f"Error: {log_print_file} does not exist.")
+        log(f"Error: {log_print_file} does not exist.")
         return set()
 
     patterns = set()
@@ -34,26 +36,84 @@ def extract_patterns(log_print_file):
 
     return patterns
 
-def run_grep(log_print_file):
-    cmd = [
-        "grep",
-        "-nir",
-        "log",
-        SOURCE_DIR,
-        "--include=*.c",
-        "--include=*.cpp",
-        "--include=*.java",
-    ]
+def run_grep(log_print_file, source_path):
+    """
+    优先使用高性能命令行工具扫描源码（rg/grep），失败时回退到 Python 扫描。
+    输出格式统一为 file:line:text
+    """
+    source_exts = {".c", ".cpp", ".java"}
+    target_source_path = os.path.abspath(source_path)
 
-    log(f"Running: {' '.join(cmd)} > {log_print_file}")
+    rg_bin = shutil.which("rg")
+    if rg_bin:
+        if os.path.isfile(target_source_path):
+            cmd = [rg_bin, "-n", "-i", "log", target_source_path]
+        else:
+            cmd = [rg_bin, "-n", "-i", "log", target_source_path, "-g", "*.c", "-g", "*.cpp", "-g", "*.java"]
+        log(f"使用 rg 扫描: {' '.join(cmd)}")
+        with open(log_print_file, "w", encoding="utf-8") as out:
+            result = subprocess.run(cmd, stdout=out, stderr=subprocess.PIPE, text=True)
+        if result.returncode in (0, 1):
+            log(f"rg 扫描完成，输出到 {log_print_file}")
+            return
+        log(f"[WARN] rg 扫描失败，回退: {result.stderr.strip()}")
+
+    grep_bin = shutil.which("grep")
+    if grep_bin:
+        if os.path.isfile(target_source_path):
+            cmd = [grep_bin, "-ni", "log", target_source_path]
+        else:
+            cmd = [
+                grep_bin,
+                "-nir",
+                "log",
+                target_source_path,
+                "--include=*.c",
+                "--include=*.cpp",
+                "--include=*.java",
+            ]
+        log(f"使用 grep 扫描: {' '.join(cmd)}")
+        with open(log_print_file, "w", encoding="utf-8") as out:
+            result = subprocess.run(cmd, stdout=out, stderr=subprocess.PIPE, text=True)
+        if result.returncode in (0, 1):
+            log(f"grep 扫描完成，输出到 {log_print_file}")
+            return
+        log(f"[WARN] grep 扫描失败，回退: {result.stderr.strip()}")
+
+    def should_scan_file(file_path):
+        _, ext = os.path.splitext(file_path)
+        return ext.lower() in source_exts
+
+    hit_count = 0
     with open(log_print_file, "w", encoding="utf-8") as out:
-        subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, check=False)
+        if os.path.isfile(target_source_path):
+            scan_files = [target_source_path] if should_scan_file(target_source_path) else []
+        else:
+            scan_files = []
+            for root, _, files in os.walk(target_source_path):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    if should_scan_file(fp):
+                        scan_files.append(fp)
+
+        for fp in scan_files:
+            try:
+                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                    for idx, line in enumerate(f, start=1):
+                        if "log" in line.lower():
+                            out.write(f"{fp}:{idx}:{line.rstrip()}\n")
+                            hit_count += 1
+            except Exception as e:
+                log(f"[WARN] 扫描文件失败，已跳过: {fp} ({e})")
+
+    log(f"Python 扫描完成，命中 {hit_count} 行，输出到 {log_print_file}")
 
 
-def extract_log_print_patterns_to_file():
-    current_dir = os.path.dirname(SOURCE_DIR)
+def extract_log_print_patterns_to_file(source_path=None):
+    target_source_path = source_path or SOURCE_DIR
+    current_dir = os.path.dirname(os.path.abspath(target_source_path))
     log_print_file = os.path.join(current_dir, "log_print.txt")
-    run_grep(log_print_file)
+    run_grep(log_print_file, target_source_path)
     patterns = extract_patterns(log_print_file)
     
     if not patterns:
@@ -102,9 +162,9 @@ def extract_log_print_patterns_to_file():
         {json_item}
         输出要求：只返回 Yes 或 No，不要输出其他内容。
         """
-        resp = call_llm(prompt, model="qwen3:8b-q8_0", temperature=0.3, top_p=0.1, ctx_num=4096)
+        resp = llm_agent.run(prompt)
         log(f"resp: {resp}")
-        if "Yes" in resp.strip():
+        if resp and "Yes" in resp.strip():
             log(f"tag {item['tag']} is log tag.")
             collect_log_tags.add(item["tag"])
 
@@ -118,6 +178,8 @@ def extract_log_print_patterns_to_file():
     log(json.dumps(output, ensure_ascii=False))
 
     log(f"Results written to {extracted_log_print_patterns_file}")
+    return {"log_print_file": log_print_file, "extracted_log_print_patterns_file": extracted_log_print_patterns_file}
+
 
 if __name__ == "__main__":
     extract_log_print_patterns_to_file()

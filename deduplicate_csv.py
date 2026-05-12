@@ -1,7 +1,7 @@
 import csv
 import os
 import sys
-from logger import log
+from utils.logger import log
 
 input_file = '/home/bj17300-049u/work/mediahal_wraper/01201605_mediahal_logset_extracted_cleaned.csv'
 output_csv_file = '/home/bj17300-049u/work/mediahal_wraper/01201605_mediahal_logset_extracted_cleaned_deduplicated.csv'

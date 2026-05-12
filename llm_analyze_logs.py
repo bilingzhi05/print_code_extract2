@@ -7,7 +7,9 @@ import argparse
 import contextlib
 import io
 import re
-from logger import log
+from utils.logger import log
+from utils.agent import ImpAgent
+from utils.config import LLM_MODEL
 
 # Ensure we can import from the current directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -15,16 +17,17 @@ sys.path.append(current_dir)
 
 # Import TokenSplitter
 try:
-    from token_splitter import TokenSplitter
+    from utils.token_splitter import TokenSplitter
 except ImportError as e:
-    log(f"Error importing TokenSplitter: {e}")
+    log(f"导入 TokenSplitter 失败: {e}")
     sys.exit(1)
 OUTPUT_FAIL_FILE = os.path.join(current_dir, "01201605_mediahal_logset_suspicious_analysis_fail.txt")
 INPUT_FILE = os.path.join(current_dir, "01201605_mediahal_logset_deduplicated.txt")
 OUTPUT_FILE = os.path.join(current_dir, "01201605_mediahal_logset_suspicious_analysis.txt")
 OLLAMA_URL = "http://10.58.11.60:11434/api/generate"
-MODEL = "qwen3:8b-q8_0"
+MODEL = LLM_MODEL
 BATCH_TOKEN_LIMIT = 512  # Conservative limit to allow space for prompt and response
+llm_agent = ImpAgent()
 
 @contextlib.contextmanager
 def suppress_stdout():
@@ -103,41 +106,27 @@ def construct_prompt(batch_items):
         【三、输出格式（严格要求）】
         ====================
 
-        对于每一条可疑日志，必须严格按照以下格式换行输出（保留大写关键字）：
-        输出格式：
-        SUSPICIOUS_ID: <ID> | REASON: <简要说明原因>
-        如果本批次中没有可疑日志，请仅回复 'NONE'。
+        必须仅输出一个 JSON 对象，不要输出任何额外说明文字，格式如下：
+        {{
+          "suspicious": [
+            {{"id": <ID>, "reason": "<简要说明原因>"}}
+          ],
+          "normal": [
+            {{"id": <ID>, "reason": "<判定为正常的简要原因>"}}
+          ]
+        }}
+
+        要求：
+        - suspicious 和 normal 都必须存在（可为空数组）
+        - 每条输入日志必须被归类到 suspicious 或 normal 之一
+        - id 必须使用输入中的日志 ID（整数）
+        - 如果本批次没有可疑日志，"suspicious" 返回 []，不要输出 NONE
 
     """
     return prompt
 
 def call_llm(prompt, retry=3, model="qwen3:8b-q8_0", temperature=0.3, top_p=0.3, ctx_num=8192):
-    log(f"prompt: {prompt}")
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "top_p": top_p,
-            "num_ctx": ctx_num 
-        }
-    }
-    
-    for attempt in range(retry):
-        try:
-            response = requests.post(OLLAMA_URL, json=payload, timeout=600) # Increased timeout for batch
-            if response.status_code == 200:
-                result = response.json()
-                return result.get("response", "").strip()
-            else:
-                log(f"Error from Ollama (Attempt {attempt+1}): {response.status_code} - {response.text}")
-                time.sleep(2)
-        except Exception as e:
-            log(f"Exception calling Ollama (Attempt {attempt+1}): {e}")
-            time.sleep(2)
-    
-    return None
+    return llm_agent.run(prompt)
 
 def analyze_batch(batch_items, retry=3):
     """
@@ -149,53 +138,116 @@ def analyze_batch(batch_items, retry=3):
     prompt = construct_prompt(batch_items)
     return call_llm(prompt, retry)
 
-def main():
-    parser = argparse.ArgumentParser(description="Analyze logs using Ollama in batches.")
-    parser.add_argument("--limit", type=int, default=0, help="Limit number of lines to process")
-    args = parser.parse_args()
+def _write_batch_result(analysis_result, current_batch, output_file, fail_output_file):
+    suspicious_count = 0
+    if not analysis_result:
+        return suspicious_count
 
+    def _parse_json_result(raw_text):
+        text = (raw_text or "").strip()
+        if not text:
+            return None
+        # 优先直接按 JSON 解析
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        # 兜底：提取第一个 JSON 对象片段
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+        return None
+
+    parsed = _parse_json_result(analysis_result)
+    if isinstance(parsed, dict):
+        suspicious_items = parsed.get("suspicious", [])
+        if not isinstance(suspicious_items, list):
+            suspicious_items = []
+        with open(output_file, 'a', encoding='utf-8') as out_f:
+            for item in suspicious_items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    log_id = int(item.get("id"))
+                except Exception:
+                    continue
+                reason_part = str(item.get("reason", "未知原因")).strip() or "未知原因"
+                original_log = next((x['line'] for x in current_batch if x['id'] == log_id), None)
+                if original_log:
+                    suspicious_count += 1
+                    log(f"  [!] 发现可疑日志 ID {log_id}")
+                    out_f.write(f"日志 ID {log_id}:\n")
+                    out_f.write(f"内容: {original_log}\n")
+                    out_f.write(f"分析: {reason_part}\n")
+                    out_f.write("-" * 30 + "\n")
+        return suspicious_count
+
+    # 兼容旧格式输出: SUSPICIOUS_ID: <ID> | REASON: ...
+    with open(output_file, 'a', encoding='utf-8') as out_f:
+        analysis_lines = analysis_result.splitlines()
+        log(f"分析结果行数: {len(analysis_lines)}")
+        for res_line in analysis_lines:
+            res_line = res_line.strip()
+            if res_line.startswith("SUSPICIOUS_ID:"):
+                try:
+                    parts = res_line.split('|', 1)
+                    id_part = parts[0].replace("SUSPICIOUS_ID:", "").strip()
+                    reason_part = parts[1].replace("REASON:", "").strip() if len(parts) > 1 else "未知原因"
+                    log_id = int(id_part)
+                    original_log = next((item['line'] for item in current_batch if item['id'] == log_id), None)
+                    if original_log:
+                        suspicious_count += 1
+                        log(f"  [!] 发现可疑日志 ID {log_id}")
+                        out_f.write(f"日志 ID {log_id}:\n")
+                        out_f.write(f"内容: {original_log}\n")
+                        out_f.write(f"分析: {reason_part}\n")
+                        out_f.write("-" * 30 + "\n")
+                except Exception as parse_e:
+                    log(f"  [x] 解析结果行失败: {res_line} ({parse_e})")
+            else:
+                with open(fail_output_file, 'a', encoding='utf-8') as fail_f:
+                    failed_batch = "\n".join(item['line'] for item in current_batch)
+                    fail_f.write(f"{failed_batch}\n")
+    return suspicious_count
+
+
+def extract_suspicious_logs(input_file: str, output_file: str, limit: int = 0, fail_output_file: str = OUTPUT_FAIL_FILE) -> dict:
+    """
+    可疑日志提取转换函数：
+    从输入日志文件中按批次识别疑似报错日志，并将结果写入输出文件。
+    """
     # Initialize TokenSplitter
     try:
         splitter = TokenSplitter()
     except Exception as e:
-        log(f"Failed to initialize TokenSplitter: {e}")
-        return
+        raise RuntimeError(f"初始化 TokenSplitter 失败: {e}")
 
-    if not os.path.exists(INPUT_FILE):
-        log(f"Input file not found: {INPUT_FILE}")
-        return
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"输入文件不存在: {input_file}")
 
-    with open(INPUT_FILE, 'r', encoding='utf-8') as f:
-        # Read all lines and filter empty ones
+    with open(input_file, 'r', encoding='utf-8') as f:
         lines = [line.strip() for line in f if line.strip()]
 
     total_lines = len(lines)
-    log(f"Total lines available: {total_lines}")
-    
-    if args.limit > 0:
-        lines = lines[:args.limit]
-        log(f"Limiting analysis to first {args.limit} lines.")
+    log(f"可用日志总行数: {total_lines}")
+    if limit > 0:
+        lines = lines[:limit]
+        log(f"限制只分析前 {limit} 行。")
 
-    log(f"Starting BATCH analysis of {len(lines)} lines using model {MODEL}...")
-    
-    suspicious_count = 0
+    log(f"开始批量分析，共 {len(lines)} 行，使用模型 {MODEL}...")
     start_time = time.time()
-    
-    # Initialize output file (Write header)
-    # with open(OUTPUT_FILE, 'w', encoding='utf-8') as out_f:
-    #     out_f.write(f"Log Analysis Report (Batch Mode)\nDate: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    #     out_f.write(f"Model: {MODEL}\n")
-    #     out_f.write(f"Source: {INPUT_FILE}\n")
-    #     out_f.write("-" * 50 + "\n\n")
-
     suspicious_count = 0
-    start_time = time.time()
-    
     current_batch = []
     current_batch_tokens = 0
-    
+
+    # 每次运行先清空输出文件
+    open(output_file, "w", encoding="utf-8").close()
+    open(fail_output_file, "w", encoding="utf-8").close()
+
     for i, line in enumerate(lines):
-        # 1. Count tokens
         token_count = 0
         try:
             with suppress_stdout():
@@ -204,91 +256,64 @@ def main():
             try:
                 token_count = splitter.tokenize(line)
             except Exception:
-                token_count = 10 # Fallback estimate
-        
-        # 2. Check if batch is full
-        # We use a rough estimate: existing tokens + new line tokens + overhead per line (e.g. 10 tokens for ID prefix)
+                token_count = 10
+
         line_overhead = 10
         if current_batch and (current_batch_tokens + token_count + line_overhead > BATCH_TOKEN_LIMIT):
-            # Process current batch
-            log(f"Processing batch of {len(current_batch)} logs ({current_batch_tokens} tokens)...")
-            analysis_result = analyze_batch(current_batch)
-            log(f"analysis_result: {analysis_result}")
-            if analysis_result:
-                # Parse and write results immediately (Append mode)
-                with open(OUTPUT_FILE, 'a', encoding='utf-8') as out_f:
-                    analysis_lines = analysis_result.splitlines()
-                    log(f"analysis_result_len: {len(analysis_lines)}")
-                    for res_line in analysis_lines:
-                        res_line = res_line.strip()
-                        if res_line.startswith("SUSPICIOUS_ID:"):
-                            # Extract ID and Reason
-                            # Format: SUSPICIOUS_ID: <ID> | REASON: <reason>
-                            try:
-                                parts = res_line.split('|', 1)
-                                id_part = parts[0].replace("SUSPICIOUS_ID:", "").strip()
-                                reason_part = parts[1].replace("REASON:", "").strip() if len(parts) > 1 else "Unknown"
-                                
-                                log_id = int(id_part)
-                                
-                                # Find original log
-                                original_log = next((item['line'] for item in current_batch if item['id'] == log_id), None)
-                                
-                                if original_log:
-                                    suspicious_count += 1
-                                    log(f"  [!] Found suspicious log ID {log_id}")
-                                    out_f.write(f"Log ID {log_id}:\n")
-                                    out_f.write(f"Content: {original_log}\n")
-                                    out_f.write(f"Analysis: {reason_part}\n")
-                                    out_f.write("-" * 30 + "\n")
-                            except Exception as parse_e:
-                                log(f"  [x] Error parsing result line: {res_line} ({parse_e})")
-                        else:
-                            with open(OUTPUT_FAIL_FILE, 'a', encoding='utf-8') as out_f:
-                                failed_batch = "\n".join(item['line'] for item in current_batch)
-                                out_f.write(f"{failed_batch}\n")
-            # Clear batch
+            log(f"正在处理一批日志: {len(current_batch)} 条（约 {current_batch_tokens} tokens）...")
+            try:
+                analysis_result = analyze_batch(current_batch)
+                log(f"分析结果: {analysis_result}")
+                suspicious_count += _write_batch_result(analysis_result, current_batch, output_file, fail_output_file)
+            except Exception as e:
+                log(f"当前批次处理失败，已跳过并继续下一批: {e}")
+                with open(fail_output_file, 'a', encoding='utf-8') as fail_f:
+                    failed_batch = "\n".join(item['line'] for item in current_batch)
+                    fail_f.write(f"{failed_batch}\n")
             current_batch = []
             current_batch_tokens = 0
-        
-        # Add to batch
+
         current_batch.append({'id': i + 1, 'line': line})
         current_batch_tokens += token_count
-        
-    # Process final batch
+
     if current_batch:
-        log(f"Processing final batch of {len(current_batch)} logs...")
-        analysis_result = analyze_batch(current_batch)
-        log(f"analysis_result: {analysis_result}")
-        if analysis_result:
-             with open(OUTPUT_FILE, 'a', encoding='utf-8') as out_f:
-                for res_line in analysis_result.split('\n'):
-                    res_line = res_line.strip()
-                    if res_line.startswith("SUSPICIOUS_ID:"):
-                        try:
-                            parts = res_line.split('|', 1)
-                            id_part = parts[0].replace("SUSPICIOUS_ID:", "").strip()
-                            reason_part = parts[1].replace("REASON:", "").strip() if len(parts) > 1 else "Unknown"
-                            log_id = int(id_part)
-                            original_log = next((item['line'] for item in current_batch if item['id'] == log_id), None)
-                            if original_log:
-                                suspicious_count += 1
-                                log(f"  [!] Found suspicious log ID {log_id}")
-                                out_f.write(f"Log ID {log_id}:\n")
-                                out_f.write(f"Content: {original_log}\n")
-                                out_f.write(f"Analysis: {reason_part}\n")
-                                out_f.write("-" * 30 + "\n")
-                        except Exception:
-                            pass
-                    else:
-                        with open(OUTPUT_FAIL_FILE, 'a', encoding='utf-8') as out_f:
-                            failed_batch = "\n".join(item['line'] for item in current_batch)
-                            out_f.write(f"{failed_batch}\n")
+        log(f"正在处理最后一批日志: {len(current_batch)} 条...")
+        try:
+            analysis_result = analyze_batch(current_batch)
+            log(f"分析结果: {analysis_result}")
+            suspicious_count += _write_batch_result(analysis_result, current_batch, output_file, fail_output_file)
+        except Exception as e:
+            log(f"最后一批处理失败，已记录失败内容: {e}")
+            with open(fail_output_file, 'a', encoding='utf-8') as fail_f:
+                failed_batch = "\n".join(item['line'] for item in current_batch)
+                fail_f.write(f"{failed_batch}\n")
+
     duration = time.time() - start_time
-    log(f"\n\nBatch Analysis complete in {duration:.2f} seconds.")
-    log(f"Total lines processed: {len(lines)}")
-    log(f"Suspicious logs found: {suspicious_count}")
-    log(f"Results saved to: {OUTPUT_FILE}")
+    log(f"\n\n批量分析完成，耗时 {duration:.2f} 秒。")
+    log(f"实际处理行数: {len(lines)}")
+    log(f"发现可疑日志数: {suspicious_count}")
+    log(f"结果已保存到: {output_file}")
+    return {
+        "input_file": input_file,
+        "output_file": output_file,
+        "fail_output_file": fail_output_file,
+        "processed_lines": len(lines),
+        "suspicious_count": suspicious_count,
+        "duration_seconds": round(duration, 2),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="使用 Ollama 批量识别可疑日志。")
+    parser.add_argument("--input", type=str, default=INPUT_FILE, help="输入日志文件路径")
+    parser.add_argument("--output", type=str, default=OUTPUT_FILE, help="输出结果文件路径")
+    parser.add_argument("--limit", type=int, default=0, help="限制处理的日志行数")
+    args = parser.parse_args()
+
+    try:
+        extract_suspicious_logs(args.input, args.output, args.limit, OUTPUT_FAIL_FILE)
+    except Exception as e:
+        log(str(e))
 
 if __name__ == "__main__":
     # main()
@@ -459,5 +484,5 @@ ID:896 | LOG:pthread_create ok DequeueDisPlayerBufferThread:%ld
         SUSPICIOUS_ID: <ID> | REASON: <简要说明原因>
         如果本批次中没有可疑日志，请仅回复 'NONE'。
     """
-    response = call_llm(prompt)
+    response = llm_agent.run(prompt)
     print(response)

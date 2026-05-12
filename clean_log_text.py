@@ -1,7 +1,7 @@
 import csv
 import os
 import sys
-
+from utils.logger import log
 input_file = '/home/bj17300-049u/work/mediahal_wraper/01201605_mediahal_logset_extracted.csv'
 output_csv_file = '/home/bj17300-049u/work/mediahal_wraper/01201605_mediahal_logset_extracted_cleaned.csv'
 
@@ -35,7 +35,7 @@ def should_keep_row(text):
 
 def process_csv(input_path, output_csv_path):
     if not os.path.exists(input_path):
-        print(f"Error: Input file not found at {input_path}")
+        log(f"Error: Input file not found at {input_path}")
         return
 
     try:
@@ -53,13 +53,13 @@ def process_csv(input_path, output_csv_path):
             fieldnames = reader.fieldnames
             
             if not fieldnames or 'text' not in fieldnames:
-                 print("Error: Column 'text' not found in CSV or file is empty.")
+                 log("Error: Column 'text' not found in CSV or file is empty.")
                  return
 
             writer = csv.DictWriter(f_out_csv, fieldnames=fieldnames)
             writer.writeheader()
 
-            print("Processing rows...")
+            log("Processing rows...")
             for row in reader:
                 rows_read += 1
                 original_text = row['text']
@@ -78,15 +78,15 @@ def process_csv(input_path, output_csv_path):
                     writer.writerow(row)
                     rows_filtered += 1
         
-        print("-" * 30)
-        print(f"Cleaning Complete:")
-        print(f"Total rows read: {rows_read}")
-        print(f"Rows written:    {rows_written}")
-        print(f"Rows filtered:   {rows_filtered}")
-        print(f"CSV Output saved to: {output_csv_path}")
+        log("-" * 30)
+        log(f"Cleaning Complete:")
+        log(f"Total rows read: {rows_read}")
+        log(f"Rows written:    {rows_written}")
+        log(f"Rows filtered:   {rows_filtered}")
+        log(f"CSV Output saved to: {output_csv_path}")
 
     except Exception as e:
-        print(f"An error occurred: {e}")
+        log(f"An error occurred: {e}")
 
 if __name__ == "__main__":
     process_csv(input_file, output_csv_file)

@@ -1,0 +1,6 @@
+LLM_OLLAMA_URL = "http://10.58.11.60:11434/api/generate"
+LLM_MODEL = "qwen3:8b-q8_0"
+LLM_TEMPERATURE = 0.3
+LLM_TOP_P = 0.3
+LLM_CTX_NUM = 8192
+LLM_RETRY = 3

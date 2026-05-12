@@ -1,10 +1,10 @@
 import re
 import os
-# time rg -i -f print_regex_patterns_0114.txt '/home/amlogic/RAG/clean_log/clean_BJ-IPTV-26084-h264-花屏-resolved.log' > filterIPTV-26084_log.txt
+# time rg -i -f log_regex_patterns_0114.txt '/home/amlogic/RAG/clean_log/clean_BJ-IPTV-26084-h264-花屏-resolved.log' > filterIPTV-26084_log.txt
 INPUT_FILE = "/home/bj17300-049u/work/LibPlayer_wraper/20260122_173551_LibPlayer_logset/20260122_173551_LibPlayer_logset_suspicious_analysis.txt"
 EXTRACTED_FILE = "/home/bj17300-049u/work/LibPlayer_wraper/20260122_173551_LibPlayer_logset/20260122_173551_LibPlayer_logset_extracted_contents.txt"
 REGEX_FILE = "/home/bj17300-049u/work/LibPlayer_wraper/20260122_173551_LibPlayer_logset/20260122_173551_LibPlayer_logset_suspicious_analysis_re.txt"
-
+from utils.logger import log
 PLACEHOLDER_MAP = {
     # signed integers
     "%lld": r"(-?\d+)",          # long long
@@ -55,18 +55,19 @@ PLACEHOLDER_MAP = {
     "%%":   r"%",                       # escaped percent
 }
 
-def normalize_placeholders(line):
-    pattern = re.compile(r"%(?:[-+ #0]*)(?:\d+)?(?:\.\d+)?(hh|h|ll|l|z|t|j)?([diuoxXfFeEgGaAcsp%])")
-    def repl(match):
-        length = match.group(1) or ""
-        spec = match.group(2)
-        if spec == "%":
-            return "%%"
-        candidate = f"%{length}{spec}"
-        if candidate in PLACEHOLDER_MAP:
-            return candidate
-        return f"%{spec}"
-    return pattern.sub(repl, line)
+def strip_trailing_percent(text: str) -> str:
+    """
+    移除日志末尾孤立的 '%'（例如: 'Invalid xxx: %' -> 'Invalid xxx:'）。
+    不处理末尾为 '%%' 的情况。
+    """
+    if text is None:
+        return ""
+    s = str(text).rstrip()
+    if len(s) >= 2 and s.endswith("%%"):
+        return s
+    if s.endswith("%"):
+        s = s[:-1].rstrip()
+    return s
 
 def normalize_placeholders(line):
     pattern = re.compile(r"%(?:[-+ #0]*)(?:\d+)?(?:\.\d+)?(hh|h|ll|l|z|t|j)?([diuoxXfFeEgGaAcsp%])")
@@ -81,31 +82,44 @@ def normalize_placeholders(line):
         return f"%{spec}"
     return pattern.sub(repl, line)
 
-def extract_content():
-    print(f"Extracting content from {INPUT_FILE}...")
+def normalize_placeholders(line):
+    pattern = re.compile(r"%(?:[-+ #0]*)(?:\d+)?(?:\.\d+)?(hh|h|ll|l|z|t|j)?([diuoxXfFeEgGaAcsp%])")
+    def repl(match):
+        length = match.group(1) or ""
+        spec = match.group(2)
+        if spec == "%":
+            return "%%"
+        candidate = f"%{length}{spec}"
+        if candidate in PLACEHOLDER_MAP:
+            return candidate
+        return f"%{spec}"
+    return pattern.sub(repl, line)
+
+def extract_log_content_from_file(input_file, extracted_file):
+    log(f"Extracting content from {input_file}...")
     extracted_lines = []
-    if not os.path.exists(INPUT_FILE):
-        print(f"Error: {INPUT_FILE} does not exist.")
+    if not os.path.exists(input_file):
+        log(f"Error: {input_file} does not exist.")
         return []
 
-    with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+    with open(input_file, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
-            if line.startswith("Content:"):
-                # Extract text after "Content:" and strip whitespace
-                content = line[len("Content:"):].strip()
+            if line.startswith("内容:"):
+                # Extract text after "内容:" and strip whitespace
+                content = strip_trailing_percent(line[len("内容:"):].strip())
                 extracted_lines.append(content)
     
     # Write extracted content to file
-    with open(EXTRACTED_FILE, 'w', encoding='utf-8') as f:
+    with open(extracted_file, 'w', encoding='utf-8') as f:
         for line in extracted_lines:
             f.write(line + "\n")
     
-    print(f"Extracted {len(extracted_lines)} lines to {EXTRACTED_FILE}")
+    log(f"Extracted {len(extracted_lines)} lines to {extracted_file}")
     return extracted_lines
 
-def generate_regex(lines):
-    print(f"Generating regex patterns to {REGEX_FILE}...")
+def generate_regex_from_wildcard_logs(lines, regex_file):
+    log(f"Generating regex patterns to {regex_file}...")
     
     # Sort keys by length descending to handle longer placeholders first
     # e.g. %lld should be replaced before %d
@@ -113,7 +127,7 @@ def generate_regex(lines):
     
     regex_lines = []
     for line in lines:
-        current_line = normalize_placeholders(line)
+        current_line = normalize_placeholders(strip_trailing_percent(line))
         
         pattern_str = "|".join(map(re.escape, sorted_keys))
         token_pattern = re.compile(f"({pattern_str})")
@@ -136,16 +150,26 @@ def generate_regex(lines):
         # For now just the pattern content as requested.
         regex_lines.append(regex_line)
 
-    with open(REGEX_FILE, 'w', encoding='utf-8') as f:
+    with open(regex_file, 'w', encoding='utf-8') as f:
         for line in regex_lines:
             f.write(line + "\n")
             
-    print(f"Generated {len(regex_lines)} regex patterns to {REGEX_FILE}")
+    log(f"Generated {len(regex_lines)} regex patterns to {regex_file}")
+
+
+def convert_wildcard_logs_to_regex(input_file, extracted_file, regex_file):
+    """
+    将包含通配符占位符（如 %d/%s）的日志文本转换为正则表达式。
+    """
+    lines = extract_log_content_from_file(input_file, extracted_file)
+    if lines:
+        generate_regex_from_wildcard_logs(lines, regex_file)
 
 def main():
-    lines = extract_content()
-    if lines:
-        generate_regex(lines)
+    INPUT_FILE = "/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/aml_mp_sdk_0511/20260511_235255_amp_logset/20260511_235255_amp_logset_suspicious_analysis.txt"
+    EXTRACTED_FILE = "/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/aml_mp_sdk_0511/20260511_235255_amp_logset/20260511_235255_amp_logset_extracted_contents.txt"
+    REGEX_FILE = "/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/aml_mp_sdk_0511/20260511_235255_amp_logset/20260511_235255_amp_logset_extracted_contents_regex.txt"
+    convert_wildcard_logs_to_regex(INPUT_FILE, EXTRACTED_FILE, REGEX_FILE)
 
 if __name__ == "__main__":
     main()

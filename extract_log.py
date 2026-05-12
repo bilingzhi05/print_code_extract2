@@ -3,11 +3,11 @@ import re
 import argparse
 import sys
 import csv
-from logger import log
+from utils.logger import log
 
 PATTERN_FILE = "extracted_log_print_patterns.txt"
 
-def build_patterns():
+def build_patterns(pattern_file=None):
     # names = [
     #     "log_print",
     #     "log_error",
@@ -45,7 +45,8 @@ def build_patterns():
     #     "FLOGD",
     # ]
     names = []
-    with open(PATTERN_FILE, "r") as f:
+    target_pattern_file = pattern_file or PATTERN_FILE
+    with open(target_pattern_file, "r") as f:
         names.extend(f.readlines())
     names = [n.strip().replace("\n", "") for n in names]
     log(f"Extracted {len(names)} log print patterns.")
