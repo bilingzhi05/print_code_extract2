@@ -96,8 +96,10 @@ def _split_force_keep_logs_from_csv(
         return {"forced_count": 0, "remaining_count": 0}
 
     rows = []
+    fieldnames = None
     with open(input_csv_file, "r", encoding="utf-8", errors="ignore", newline="") as f:
         reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
         for idx, row in enumerate(reader, start=1):
             style = str((row or {}).get("style", "")).strip()
             text = str((row or {}).get("text", "")).strip()
@@ -112,6 +114,7 @@ def _split_force_keep_logs_from_csv(
                     "text": text,
                     "file": file_name,
                     "line": line_ref,
+                    "raw_row": dict(row or {}),
                 }
             )
 
@@ -133,23 +136,206 @@ def _split_force_keep_logs_from_csv(
             reason = f"命中高风险TAG(style={style})"
             forced.append((idx, row, reason))
         else:
-            remaining.append(row["text"])
+            remaining.append(row["raw_row"])
 
-    with open(force_output_file, "w", encoding="utf-8") as wf:
+    out_fieldnames = list(fieldnames or [])
+    if "reason" not in out_fieldnames:
+        out_fieldnames.append("reason")
+    with open(force_output_file, "w", encoding="utf-8", errors="ignore", newline="") as wf:
+        writer = csv.DictWriter(wf, fieldnames=out_fieldnames)
+        writer.writeheader()
         for idx, row, reason in forced:
-            wf.write(f"日志 ID {idx}:\n")
-            wf.write(f"style: {row['style']}\n")
-            if row["file"] or row["line"]:
-                wf.write(f"位置: {row['file']}:{row['line']}\n")
-            wf.write(f"内容: {row['text']}\n")
-            wf.write(f"分析: {reason}\n")
-            wf.write("-" * 30 + "\n")
+            raw_row = dict((row or {}).get("raw_row", {}) or {})
+            raw_row["reason"] = reason
+            writer.writerow(raw_row)
 
-    with open(remaining_output_file, "w", encoding="utf-8") as wf:
-        for line in remaining:
-            wf.write(f"{line}\n")
+    with open(remaining_output_file, "w", encoding="utf-8", errors="ignore", newline="") as wf:
+        writer = csv.DictWriter(wf, fieldnames=list(fieldnames or []))
+        writer.writeheader()
+        for raw_row in remaining:
+            if isinstance(raw_row, dict):
+                writer.writerow(raw_row)
 
-    return {"forced_count": len(forced), "remaining_count": len(remaining)}
+    return {
+        "forced_count": len(forced),
+        "remaining_count": len(remaining),
+    }
+
+def write_llm_analysis_reason_to_csv(output_file: str, input_csv_file: str, output_csv_file: str) -> dict:
+    if not os.path.exists(output_file):
+        return {"written_rows": 0, "matched_rows": 0, "missing_ids": []}
+    if not os.path.exists(input_csv_file):
+        raise FileNotFoundError(f"input csv not found: {input_csv_file}")
+
+    def _strip_trailing_percent(text: str) -> str:
+        s = (text or "").rstrip()
+        if len(s) >= 2 and s.endswith("%%"):
+            return s
+        if s.endswith("%"):
+            return s[:-1].rstrip()
+        return s
+
+    def _norm_content(text: str) -> str:
+        return _strip_trailing_percent(str(text or "").strip())
+
+    reason_by_content: dict[str, str] = {}
+    current_content: str | None = None
+    current_reason_parts: list[str] = []
+
+    def _flush_current():
+        nonlocal current_content, current_reason_parts
+        if not current_content:
+            return
+        reason = " ".join([p.strip() for p in current_reason_parts if str(p).strip()]).strip()
+        if reason:
+            if current_content in reason_by_content and reason_by_content[current_content]:
+                reason_by_content[current_content] = f"{reason_by_content[current_content]}; {reason}"
+            else:
+                reason_by_content[current_content] = reason
+        current_content = None
+        current_reason_parts = []
+
+    with open(output_file, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            s = (raw or "").rstrip("\n")
+            t = s.strip()
+            if t.startswith("日志 ID"):
+                _flush_current()
+                continue
+            if t.startswith("内容:"):
+                current_content = _norm_content(t[len("内容:") :].strip())
+                continue
+            if not current_content:
+                continue
+            if t.startswith("分析:"):
+                current_reason_parts.append(t[len("分析:") :].strip())
+                continue
+            if current_reason_parts and t and not t.startswith("-"):
+                current_reason_parts.append(t)
+                continue
+            if t.startswith("-"):
+                _flush_current()
+                continue
+    _flush_current()
+
+    with open(input_csv_file, "r", encoding="utf-8", errors="ignore", newline="") as in_f:
+        reader = csv.DictReader(in_f)
+        fieldnames = list(reader.fieldnames or [])
+        if "reason" not in fieldnames:
+            fieldnames.append("reason")
+
+        written_rows = 0
+        matched_rows = 0
+        found_contents: set[str] = set()
+
+        with open(output_csv_file, "w", encoding="utf-8", errors="ignore", newline="") as out_f:
+            writer = csv.DictWriter(out_f, fieldnames=fieldnames)
+            writer.writeheader()
+            for _, row in enumerate(reader, start=1):
+                raw_row = dict(row or {})
+                content_key = _norm_content(raw_row.get("text", ""))
+                reason = reason_by_content.get(content_key, "")
+                raw_row["reason"] = reason
+                if reason:
+                    matched_rows += 1
+                    found_contents.add(content_key)
+                    writer.writerow(raw_row)
+                    written_rows += 1
+
+    missing_ids = sorted([k for k in reason_by_content.keys() if k not in found_contents])
+    return {"written_rows": written_rows, "matched_rows": matched_rows, "missing_ids": missing_ids}
+
+def merge_csv_keep_header(first_csv: str, second_csv: str, output_csv: str) -> dict:
+    if not os.path.exists(first_csv):
+        raise FileNotFoundError(f"csv not found: {first_csv}")
+    if not os.path.exists(second_csv):
+        raise FileNotFoundError(f"csv not found: {second_csv}")
+
+    def _read_csv_rows(path: str):
+        with open(path, "r", encoding="utf-8", errors="ignore", newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            rows = [dict(r or {}) for r in reader]
+            return fieldnames, rows
+
+    fn1, rows1 = _read_csv_rows(first_csv)
+    fn2, rows2 = _read_csv_rows(second_csv)
+    if fn1 != fn2:
+        raise RuntimeError(f"csv header mismatch: {first_csv} vs {second_csv}")
+
+    with open(output_csv, "w", encoding="utf-8", errors="ignore", newline="") as out_f:
+        writer = csv.DictWriter(out_f, fieldnames=fn1)
+        writer.writeheader()
+        for r in rows1:
+            writer.writerow(r)
+        for r in rows2:
+            writer.writerow(r)
+
+    return {"written_rows": len(rows1) + len(rows2), "first_rows": len(rows1), "second_rows": len(rows2)}
+
+def _extract_log_tag_from_source_file(file_path: str, max_lines: int = 400) -> str:
+    path = str(file_path or "").strip()
+    if not path or not os.path.exists(path) or not os.path.isfile(path):
+        return ""
+    define_re = re.compile(r'^\s*#\s*define\s+LOG_TAG\s+"([^"]+)"\s*$', re.IGNORECASE)
+    define_re2 = re.compile(r"^\s*#\s*define\s+LOG_TAG\s+'([^']+)'\s*$", re.IGNORECASE)
+    const_re = re.compile(r'^\s*(?:static\s+)?(?:const\s+)?(?:char\s*\*|char\s+const\s*\*|const\s+char\s*\*)\s*LOG_TAG\s*=\s*"([^"]+)"', re.IGNORECASE)
+    array_re = re.compile(r'^\s*(?:static\s+)?(?:const\s+)?char\s+LOG_TAG\s*\[\s*\]\s*=\s*"([^"]+)"', re.IGNORECASE)
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for idx, line in enumerate(f, start=1):
+                if idx > max_lines:
+                    break
+                s = (line or "").strip()
+                m = define_re.match(s)
+                if m:
+                    return m.group(1).strip()
+                m = define_re2.match(s)
+                if m:
+                    return m.group(1).strip()
+                m = const_re.match(s)
+                if m:
+                    return m.group(1).strip()
+                m = array_re.match(s)
+                if m:
+                    return m.group(1).strip()
+    except Exception:
+        return ""
+    return ""
+
+def add_logtag_column_from_source(input_csv_file: str, output_csv_file: str) -> dict:
+    if not os.path.exists(input_csv_file):
+        raise FileNotFoundError(f"input csv not found: {input_csv_file}")
+
+    file_to_tag: dict[str, str] = {}
+    written_rows = 0
+    tag_hits = 0
+
+    with open(input_csv_file, "r", encoding="utf-8", errors="ignore", newline="") as in_f:
+        reader = csv.DictReader(in_f)
+        fieldnames = list(reader.fieldnames or [])
+        if "file" not in fieldnames:
+            raise RuntimeError(f"csv missing 'file' column: {input_csv_file}")
+        out_fieldnames = list(fieldnames)
+        if "logtag" not in out_fieldnames:
+            out_fieldnames.append("logtag")
+
+        with open(output_csv_file, "w", encoding="utf-8", errors="ignore", newline="") as out_f:
+            writer = csv.DictWriter(out_f, fieldnames=out_fieldnames)
+            writer.writeheader()
+            for row in reader:
+                raw_row = dict(row or {})
+                fp = str(raw_row.get("file", "")).strip()
+                if fp not in file_to_tag:
+                    file_to_tag[fp] = _extract_log_tag_from_source_file(fp)
+                tag = file_to_tag.get(fp, "")
+                if tag:
+                    tag_hits += 1
+                raw_row["logtag"] = tag
+                writer.writerow(raw_row)
+                written_rows += 1
+
+    return {"written_rows": written_rows, "tag_hits": tag_hits, "unique_files": len(file_to_tag)}
 
 def run_extract_log_pipeline(project: str, source_dir: str):
     log(f"开始执行日志处理流水线，项目: {project}")
@@ -184,14 +370,18 @@ def run_extract_log_pipeline(project: str, source_dir: str):
 
     # 第5步输出
     FILE_STEP_5 = f"{output_prefix}_suspicious_analysis.txt"
-    FILE_STEP_5_FORCE = f"{output_prefix}_suspicious_force_keep.txt"
+    FILE_STEP_5_FORCE = f"{output_prefix}_suspicious_force_keep.csv"
     FILE_STEP_5_LLM = f"{output_prefix}_suspicious_analysis_llm.txt"
+    FILE_STEP_5_LLM_CSV = f"{output_prefix}_suspicious_analysis_llm.csv"
+    FILE_STEP_5_ALL_CSV = f"{output_prefix}_suspicious_analysis_all.csv"
     FILE_STEP_5_FAIL = f"{output_prefix}_suspicious_analysis_fail.txt"
-    FILE_STEP_4_FOR_LLM = f"{output_prefix}_deduplicated_for_llm.txt"
+    FILE_STEP_4_FOR_LLM = f"{output_prefix}_deduplicated_for_llm.csv"
 
     # 第6步输出
     FILE_STEP_6_EXTRACTED = f"{output_prefix}_extracted_contents.txt"
+    FILE_STEP_6_OUTPUT_CSV = f"{output_prefix}_extracted_contents_regex.csv"
     FILE_STEP_6_REGEX = f"{output_prefix}_extracted_contents_regex.txt"
+    FILE_STEP_7_OUTPUT_CSV = f"{output_prefix}_extracted_contents_regex_with_logtag.csv"
 
     # --- 第1步：从源码提取日志 ---
     log(f"\n[第1步] 从 {source_dir} 提取日志到 {FILE_STEP_1}...")
@@ -257,18 +447,34 @@ def run_extract_log_pipeline(project: str, source_dir: str):
                 output_file=FILE_STEP_5_LLM,
                 fail_output_file=FILE_STEP_5_FAIL,
             )
+            llm_csv_stats = write_llm_analysis_reason_to_csv(
+                output_file=FILE_STEP_5_LLM,
+                input_csv_file=FILE_STEP_4_FOR_LLM,
+                output_csv_file=FILE_STEP_5_LLM_CSV,
+            )
+            log(f"LLM 分析结果已写入 CSV: {FILE_STEP_5_LLM_CSV}, stats={llm_csv_stats}")
         else:
             open(FILE_STEP_5_LLM, "w", encoding="utf-8").close()
+            with open(FILE_STEP_5_LLM_CSV, "w", encoding="utf-8", errors="ignore", newline="") as out_f:
+                writer = csv.DictWriter(out_f, fieldnames=["reason"])
+                writer.writeheader()
 
         # 合并：先写兜底强保留，再追加 LLM 识别结果
         with open(FILE_STEP_5, "w", encoding="utf-8") as out_f:
-            for one_file in (FILE_STEP_5_FORCE, FILE_STEP_5_LLM):
-                if os.path.exists(one_file):
-                    with open(one_file, "r", encoding="utf-8", errors="ignore") as in_f:
-                        content = in_f.read().strip()
-                        if content:
-                            out_f.write(content)
-                            out_f.write("\n")
+            forced_text = str(split_info.get("forced_text", "") or "").strip()
+            if forced_text:
+                out_f.write(forced_text)
+                out_f.write("\n")
+            if os.path.exists(FILE_STEP_5_LLM):
+                with open(FILE_STEP_5_LLM, "r", encoding="utf-8", errors="ignore") as in_f:
+                    content = in_f.read().strip()
+                    if content:
+                        out_f.write(content)
+                        out_f.write("\n")
+
+        if os.path.exists(FILE_STEP_5_LLM_CSV):
+            merge_stats = merge_csv_keep_header(FILE_STEP_5_FORCE, FILE_STEP_5_LLM_CSV, FILE_STEP_5_ALL_CSV)
+            log(f"CSV 合并完成: {FILE_STEP_5_ALL_CSV}, stats={merge_stats}")
         
         log("第5步完成。")
     except Exception as e:
@@ -279,13 +485,24 @@ def run_extract_log_pipeline(project: str, source_dir: str):
     log(f"\n[第6步] 提取分析内容并生成正则到 {FILE_STEP_6_REGEX}...")
     try:
         extract_and_convert_logs.convert_wildcard_logs_to_regex(
-            input_file=FILE_STEP_5,
+            # input_file=FILE_STEP_5,
+            input_file=FILE_STEP_5_ALL_CSV,
             extracted_file=FILE_STEP_6_EXTRACTED,
+            output_csv_file=FILE_STEP_6_OUTPUT_CSV,
             regex_file=FILE_STEP_6_REGEX,
         )
         log("第6步完成。")
     except Exception as e:
         log(f"第6步失败: {e}")
+        return
+
+    # --- 第7步：从源码中提取 LOG_TAG 并写入 CSV 的 logtag 列 ---
+    log(f"\n[第7步] 从源码文件提取 LOG_TAG，并写入 {FILE_STEP_7_OUTPUT_CSV}...")
+    try:
+        stats = add_logtag_column_from_source(FILE_STEP_6_OUTPUT_CSV, FILE_STEP_7_OUTPUT_CSV)
+        log(f"第7步完成: {FILE_STEP_7_OUTPUT_CSV}, stats={stats}")
+    except Exception as e:
+        log(f"第7步失败: {e}")
         return
 
     log("\n=== 流水线执行成功结束 ===")
@@ -326,9 +543,9 @@ def run_extract_log_pipeline_batch(pipeline_jobs):
 
 def main():
     pipeline_jobs = [
-        {"project": "audiohal", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_01201212/audio_hal"},
-        {"project": "mediahal", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/media_hal_0511/media_hal"},
-        {"project": "amp", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/aml_mp_sdk_0511/aml_mp_sdk"},
+        {"project": "audiohal", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/audio_hal"},
+        {"project": "mediahal", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/media_hal_wrapper/media_hal"},
+        # {"project": "amp", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/aml_mp_sdk_wrapper/aml_mp_sdk"},
     ]
     results = run_extract_log_pipeline_batch(pipeline_jobs)
 
@@ -337,3 +554,30 @@ if __name__ == "__main__":
 
     # fatal_error_tags = _find_fatal_error_tags_with_agent("/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_01201212/extracted_log_print_patterns.txt")
     # log(f"识别到 FATAL/ERROR 高风险 TAG 数量: {len(fatal_error_tags)}, {fatal_error_tags}")
+
+    # FILE_STEP_5_ALL_CSV = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_suspicious_analysis_all.csv"
+    # FILE_STEP_6_EXTRACTED = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_extracted_contents.txt"
+    # FILE_STEP_6_OUTPUT_CSV = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_extracted_contents_regex.csv"
+    # FILE_STEP_6_REGEX = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_extracted_contents_regex.txt"
+    #     # --- 第6步：提取并转换为正则 ---
+    # log(f"\n[第6步] 提取分析内容并生成正则到 {FILE_STEP_6_REGEX}...")
+    # try:
+    #     extract_and_convert_logs.convert_wildcard_logs_to_regex(
+    #         # input_file=FILE_STEP_5,
+    #         input_file=FILE_STEP_5_ALL_CSV,
+    #         extracted_file=FILE_STEP_6_EXTRACTED,
+    #         output_csv_file=FILE_STEP_6_OUTPUT_CSV,
+    #         regex_file=FILE_STEP_6_REGEX,
+    #     )
+    #     log("第6步完成。")
+    # except Exception as e:
+    #     log(f"第6步失败: {e}")
+
+    # FILE_STEP_7_OUTPUT_CSV = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_extracted_contents_regex_with_logtag.csv"
+    # # --- 第7步：从源码中提取 LOG_TAG 并写入 CSV 的 logtag 列 ---
+    # log(f"\n[第7步] 从源码文件提取 LOG_TAG，并写入 {FILE_STEP_7_OUTPUT_CSV}...")
+    # try:
+    #     stats = add_logtag_column_from_source(FILE_STEP_6_OUTPUT_CSV, FILE_STEP_7_OUTPUT_CSV)
+    #     log(f"第7步完成: {FILE_STEP_7_OUTPUT_CSV}, stats={stats}")
+    # except Exception as e:
+    #     log(f"第7步失败: {e}")

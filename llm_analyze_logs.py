@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import io
 import re
+import csv
 from utils.logger import log
 from utils.agent import ImpAgent
 from utils.config import LLM_MODEL
@@ -138,6 +139,51 @@ def analyze_batch(batch_items, retry=3):
     prompt = construct_prompt(batch_items)
     return call_llm(prompt, retry)
 
+def _json_loads_dict_best_effort(raw_text: str) -> dict | None:
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+def _repair_json_with_format_agent(bad_text: str) -> dict | None:
+    text = (bad_text or "").strip()
+    if not text:
+        return None
+    prompt = f"""
+你是 JSON 格式修复器。请把下面内容修复为严格可解析的 JSON 对象，必须严格符合以下 schema：
+{{
+  "suspicious": [
+    {{"id": <ID>, "reason": "<简要说明原因>"}}
+  ],
+  "normal": [
+    {{"id": <ID>, "reason": "<判定为正常的简要原因>"}}
+  ]
+}}
+
+要求：
+- 只输出 JSON（不要 markdown，不要解释，不要额外文字）
+- suspicious 和 normal 都必须存在（可为空数组）
+- 每条输入日志必须被归类到 suspicious 或 normal 之一（不要丢项）
+- id 必须为整数
+
+待修复内容：
+{text}
+"""
+    fixed = llm_agent.run(prompt) or ""
+    return _json_loads_dict_best_effort(fixed)
+
 def _write_batch_result(analysis_result, current_batch, output_file, fail_output_file):
     suspicious_count = 0
     if not analysis_result:
@@ -145,21 +191,10 @@ def _write_batch_result(analysis_result, current_batch, output_file, fail_output
 
     def _parse_json_result(raw_text):
         text = (raw_text or "").strip()
-        if not text:
-            return None
-        # 优先直接按 JSON 解析
-        try:
-            return json.loads(text)
-        except Exception:
-            pass
-        # 兜底：提取第一个 JSON 对象片段
-        m = re.search(r"\{[\s\S]*\}", text)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                return None
-        return None
+        parsed = _json_loads_dict_best_effort(text)
+        if isinstance(parsed, dict):
+            return parsed
+        return _repair_json_with_format_agent(text)
 
     parsed = _parse_json_result(analysis_result)
     if isinstance(parsed, dict):
@@ -227,9 +262,13 @@ def extract_suspicious_logs(input_file: str, output_file: str, limit: int = 0, f
 
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"输入文件不存在: {input_file}")
-
-    with open(input_file, 'r', encoding='utf-8') as f:
-        lines = [line.strip() for line in f if line.strip()]
+    lines = []
+    with open(input_file, "r", encoding="utf-8", errors="ignore", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            text = str((row or {}).get("text", "")).strip()
+            if text:
+                lines.append(text)
 
     total_lines = len(lines)
     log(f"可用日志总行数: {total_lines}")
