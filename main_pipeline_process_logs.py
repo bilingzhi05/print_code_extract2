@@ -303,14 +303,14 @@ def _extract_log_tag_from_source_file(file_path: str, max_lines: int = 400) -> s
         return ""
     return ""
 
-def add_logtag_column_from_source(input_csv_file: str, output_csv_file: str) -> dict:
+def add_logtag_column_from_source(input_csv_file: str, output_csv_file: str, output_txt_regex_with_tag_file: str, output_tag_file: str) -> dict:
     if not os.path.exists(input_csv_file):
         raise FileNotFoundError(f"input csv not found: {input_csv_file}")
 
     file_to_tag: dict[str, str] = {}
     written_rows = 0
     tag_hits = 0
-
+    regex_with_logtag = []
     with open(input_csv_file, "r", encoding="utf-8", errors="ignore", newline="") as in_f:
         reader = csv.DictReader(in_f)
         fieldnames = list(reader.fieldnames or [])
@@ -319,6 +319,8 @@ def add_logtag_column_from_source(input_csv_file: str, output_csv_file: str) -> 
         out_fieldnames = list(fieldnames)
         if "logtag" not in out_fieldnames:
             out_fieldnames.append("logtag")
+        if "regex_with_logtag" not in out_fieldnames:
+            out_fieldnames.append("regex_with_logtag")
 
         with open(output_csv_file, "w", encoding="utf-8", errors="ignore", newline="") as out_f:
             writer = csv.DictWriter(out_f, fieldnames=out_fieldnames)
@@ -330,10 +332,22 @@ def add_logtag_column_from_source(input_csv_file: str, output_csv_file: str) -> 
                     file_to_tag[fp] = _extract_log_tag_from_source_file(fp)
                 tag = file_to_tag.get(fp, "")
                 if tag:
+                    raw_row["regex_with_logtag"] = f"{tag}(.+?){raw_row['regex']}"
                     tag_hits += 1
+                else:
+                    # 如果没有tag,观察raw_row["text"]是否是单个单词，如果不是，直接使用，否则跳过
+                    if len(str(raw_row.get("text", "")).split()) <= 1:
+                        log(f"跳过单个单词的text: {raw_row['text']}")
+                        continue
+                    raw_row["regex_with_logtag"] = raw_row["regex"]
+                regex_with_logtag.append(raw_row["regex_with_logtag"])
                 raw_row["logtag"] = tag
                 writer.writerow(raw_row)
                 written_rows += 1
+    with open(output_txt_regex_with_tag_file, "w", encoding="utf-8", errors="ignore", newline="") as out_f:
+        out_f.write("\n".join(regex_with_logtag))
+    with open(output_tag_file, "w", encoding="utf-8", errors="ignore", newline="") as out_f:
+        out_f.write("\n".join(file_to_tag.values()))
 
     return {"written_rows": written_rows, "tag_hits": tag_hits, "unique_files": len(file_to_tag)}
 
@@ -352,48 +366,53 @@ def run_extract_log_pipeline(project: str, source_dir: str):
     # 输出目录: <current_dir>/<run_name>/
     output_dir = os.path.join(current_dir, run_name)
     os.makedirs(output_dir, exist_ok=True)
-    # 输出文件统一前缀: <output_dir>/<run_name>
-    output_prefix = os.path.join(output_dir, run_name)
+    tmp_dir = os.path.join(output_dir, f"tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
 
     # 第1步输出
-    FILE_STEP_1 = f"{output_prefix}.csv"
+    FILE_STEP_1 = os.path.join(tmp_dir, f"1_original.csv")
 
     # 第2步输出
-    FILE_STEP_2 = f"{output_prefix}_extracted.csv"
+    FILE_STEP_2 = os.path.join(tmp_dir, f"2_extracted_text.csv")
 
     # 第3步输出
-    FILE_STEP_3 = f"{output_prefix}_cleaned.csv"
+    FILE_STEP_3 = os.path.join(tmp_dir, f"3_cleaned.csv")
 
     # 第4步输出
-    FILE_STEP_4_CSV = f"{output_prefix}_deduplicated.csv"
-    FILE_STEP_4_TXT = f"{output_prefix}_deduplicated.txt"
+    FILE_STEP_4_CSV = os.path.join(tmp_dir, f"4_deduplicated.csv")
+    FILE_STEP_4_TXT = os.path.join(tmp_dir, f"4_deduplicated.txt")
 
     # 第5步输出
-    FILE_STEP_5 = f"{output_prefix}_suspicious_analysis.txt"
-    FILE_STEP_5_FORCE = f"{output_prefix}_suspicious_force_keep.csv"
-    FILE_STEP_5_LLM = f"{output_prefix}_suspicious_analysis_llm.txt"
-    FILE_STEP_5_LLM_CSV = f"{output_prefix}_suspicious_analysis_llm.csv"
-    FILE_STEP_5_ALL_CSV = f"{output_prefix}_suspicious_analysis_all.csv"
-    FILE_STEP_5_FAIL = f"{output_prefix}_suspicious_analysis_fail.txt"
-    FILE_STEP_4_FOR_LLM = f"{output_prefix}_deduplicated_for_llm.csv"
-
+    FILE_STEP_5 = os.path.join(tmp_dir, f"5_suspicious_analysis.txt")
+    FILE_STEP_5_FORCE = os.path.join(tmp_dir, f"5_suspicious_force_keep.csv")
+    FILE_STEP_5_LLM_NORMAL_CSV = os.path.join(tmp_dir, f"5_suspicious_analysis_llm_normal.csv")
+    FILE_STEP_5_LLM_SUS_CSV = os.path.join(tmp_dir, f"5_suspicious_analysis_llm_sus.csv")
+    FILE_STEP_5_ALL_CSV = os.path.join(tmp_dir, f"5_suspicious_analysis_all.csv")
+    FILE_STEP_5_FAIL_CSV = os.path.join(tmp_dir, f"5_suspicious_analysis_fail.csv")
+    FILE_STEP_4_REMAINING = os.path.join(tmp_dir, f"4_deduplicated_after_force_remaining.csv")
+    
     # 第6步输出
-    FILE_STEP_6_EXTRACTED = f"{output_prefix}_extracted_contents.txt"
-    FILE_STEP_6_OUTPUT_CSV = f"{output_prefix}_extracted_contents_regex.csv"
-    FILE_STEP_6_REGEX = f"{output_prefix}_extracted_contents_regex.txt"
-    FILE_STEP_7_OUTPUT_CSV = f"{output_prefix}_extracted_contents_regex_with_logtag.csv"
+    FILE_STEP_6_EXTRACTED = os.path.join(tmp_dir, f"6_extracted_contents.txt")
+    FILE_STEP_6_OUTPUT_CSV = os.path.join(tmp_dir, f"6_extracted_contents_regex.csv")
+    FILE_STEP_6_REGEX = os.path.join(tmp_dir, f"6_extracted_contents_regex.txt")
+
+    # 第7步输出
+    FILE_STEP_7_OUTPUT_CSV = os.path.join(tmp_dir, f"7_regex_with_logtag.csv")
+    FILE_STEP_7_OUTPUT_LOGTAG = os.path.join(tmp_dir, f"7_logtag.txt")
+    FILE_STEP_7_OUTPUT_REGEX_WITH_LOGTAG_TXT = os.path.join(output_dir, f"7_extracted_contents_regex_with_logtag.txt")
 
     # --- 第1步：从源码提取日志 ---
     log(f"\n[第1步] 从 {source_dir} 提取日志到 {FILE_STEP_1}...")
     try:
         # 提取日志打印模式
-        pattern_result = extract_log_print_patterns_to_file(source_dir)
+        source_exts={".c", ".cpp", ".h"}
+        pattern_result = extract_log_print_patterns_to_file(source_dir, source_exts=source_exts)
         extracted_log_print_patterns_file = pattern_result["extracted_log_print_patterns_file"]
         patterns, starters = extract_log.build_patterns(extracted_log_print_patterns_file)
         if os.path.isfile(source_dir):
             rows = extract_log.scan_file(source_dir, patterns, starters)
         else:
-            rows = extract_log.walk_root(source_dir, patterns, starters)
+            rows = extract_log.walk_root(source_dir, patterns, starters, source_exts=source_exts)
         extract_log.write_output(FILE_STEP_1, rows, "csv")
         log(f"第1步完成，提取到 {len(rows)} 行。")
     except Exception as e:
@@ -402,7 +421,7 @@ def run_extract_log_pipeline(project: str, source_dir: str):
     
 
     # --- 第2步：提取内容（引号内字符串） ---
-    log(f"\n[第2步] 提取引号内容到 {FILE_STEP_2}...")
+    log(f"\n[第2步] 提取引号正文内容到 {FILE_STEP_2}...")
     try:
         extract_log_content.process_csv(FILE_STEP_1, FILE_STEP_2)
         log("第2步完成。")
@@ -428,7 +447,7 @@ def run_extract_log_pipeline(project: str, source_dir: str):
         log(f"第4步失败: {e}")
         return
     # --- 第5步：FATAL/ERROR 兜底 + LLM 分析 ---
-    log(f"\n[第5步] 使用 Ollama 分析日志并输出到 {FILE_STEP_5}...")
+    log(f"\n[第5步] 使用 Ollama 分析日志并输出到 {FILE_STEP_5_ALL_CSV}...")
     try:
         fatal_error_tags = _find_fatal_error_tags_with_agent(extracted_log_print_patterns_file)
         log(f"识别到 FATAL/ERROR 高风险 TAG 数量: {len(fatal_error_tags)}")
@@ -436,45 +455,40 @@ def run_extract_log_pipeline(project: str, source_dir: str):
         split_info = _split_force_keep_logs_from_csv(
             input_csv_file=FILE_STEP_4_CSV,
             force_output_file=FILE_STEP_5_FORCE,
-            remaining_output_file=FILE_STEP_4_FOR_LLM,
+            remaining_output_file=FILE_STEP_4_REMAINING,
             fatal_error_tags=fatal_error_tags,
         )
         log(f"强制保留日志: {split_info.get('forced_count', 0)} 条，待 LLM 分析日志: {split_info.get('remaining_count', 0)} 条")
 
         if split_info.get("remaining_count", 0) > 0:
             llm_analyze_logs.extract_suspicious_logs(
-                input_file=FILE_STEP_4_FOR_LLM,
-                output_file=FILE_STEP_5_LLM,
-                fail_output_file=FILE_STEP_5_FAIL,
+                input_file=FILE_STEP_4_REMAINING,
+                output_file=FILE_STEP_5_LLM_SUS_CSV,
+                output_normal_file=FILE_STEP_5_LLM_NORMAL_CSV,
+                fail_output_file=FILE_STEP_5_FAIL_CSV,
             )
-            llm_csv_stats = write_llm_analysis_reason_to_csv(
-                output_file=FILE_STEP_5_LLM,
-                input_csv_file=FILE_STEP_4_FOR_LLM,
-                output_csv_file=FILE_STEP_5_LLM_CSV,
-            )
-            log(f"LLM 分析结果已写入 CSV: {FILE_STEP_5_LLM_CSV}, stats={llm_csv_stats}")
-        else:
-            open(FILE_STEP_5_LLM, "w", encoding="utf-8").close()
-            with open(FILE_STEP_5_LLM_CSV, "w", encoding="utf-8", errors="ignore", newline="") as out_f:
-                writer = csv.DictWriter(out_f, fieldnames=["reason"])
-                writer.writeheader()
+            # llm_csv_stats = write_llm_analysis_reason_to_csv(
+            #     output_file=FILE_STEP_5_LLM,
+            #     input_csv_file=FILE_STEP_4_REMAINING,
+            #     output_csv_file=FILE_STEP_5_LLM_CSV,
+            # )
+            log(f"LLM 分析结果已写入 CSV: {FILE_STEP_5_LLM_SUS_CSV}")
+        force_exists = os.path.exists(FILE_STEP_5_FORCE)
+        llm_exists = os.path.exists(FILE_STEP_5_LLM_SUS_CSV)
 
-        # 合并：先写兜底强保留，再追加 LLM 识别结果
-        with open(FILE_STEP_5, "w", encoding="utf-8") as out_f:
-            forced_text = str(split_info.get("forced_text", "") or "").strip()
-            if forced_text:
-                out_f.write(forced_text)
-                out_f.write("\n")
-            if os.path.exists(FILE_STEP_5_LLM):
-                with open(FILE_STEP_5_LLM, "r", encoding="utf-8", errors="ignore") as in_f:
-                    content = in_f.read().strip()
-                    if content:
-                        out_f.write(content)
-                        out_f.write("\n")
-
-        if os.path.exists(FILE_STEP_5_LLM_CSV):
-            merge_stats = merge_csv_keep_header(FILE_STEP_5_FORCE, FILE_STEP_5_LLM_CSV, FILE_STEP_5_ALL_CSV)
+        import shutil
+        if force_exists and llm_exists:
+            merge_stats = merge_csv_keep_header(FILE_STEP_5_FORCE, FILE_STEP_5_LLM_SUS_CSV, FILE_STEP_5_ALL_CSV)
             log(f"CSV 合并完成: {FILE_STEP_5_ALL_CSV}, stats={merge_stats}")
+        elif force_exists:
+            shutil.copy2(FILE_STEP_5_FORCE, FILE_STEP_5_ALL_CSV)
+            log(f"仅存在 force_keep 日志，已拷贝到: {FILE_STEP_5_ALL_CSV}")
+        elif llm_exists:
+            shutil.copy2(FILE_STEP_5_LLM_SUS_CSV, FILE_STEP_5_ALL_CSV)
+            log(f"仅存在 llm_sus 日志，已拷贝到: {FILE_STEP_5_ALL_CSV}")
+        else:
+            log(f"两个来源均不存在，不创建 {FILE_STEP_5_ALL_CSV}")
+
         
         log("第5步完成。")
     except Exception as e:
@@ -499,7 +513,7 @@ def run_extract_log_pipeline(project: str, source_dir: str):
     # --- 第7步：从源码中提取 LOG_TAG 并写入 CSV 的 logtag 列 ---
     log(f"\n[第7步] 从源码文件提取 LOG_TAG，并写入 {FILE_STEP_7_OUTPUT_CSV}...")
     try:
-        stats = add_logtag_column_from_source(FILE_STEP_6_OUTPUT_CSV, FILE_STEP_7_OUTPUT_CSV)
+        stats = add_logtag_column_from_source(FILE_STEP_6_OUTPUT_CSV, FILE_STEP_7_OUTPUT_CSV, FILE_STEP_7_OUTPUT_REGEX_WITH_LOGTAG_TXT, FILE_STEP_7_OUTPUT_LOGTAG)
         log(f"第7步完成: {FILE_STEP_7_OUTPUT_CSV}, stats={stats}")
     except Exception as e:
         log(f"第7步失败: {e}")
@@ -545,21 +559,21 @@ def main():
     pipeline_jobs = [
         {"project": "audiohal", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/audio_hal"},
         {"project": "mediahal", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/media_hal_wrapper/media_hal"},
-        # {"project": "amp", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/aml_mp_sdk_wrapper/aml_mp_sdk"},
+        {"project": "amp", "source_dir": r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/aml_mp_sdk_wrapper/aml_mp_sdk"},
     ]
     results = run_extract_log_pipeline_batch(pipeline_jobs)
 
 if __name__ == "__main__":
     main()
-
     # fatal_error_tags = _find_fatal_error_tags_with_agent("/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_01201212/extracted_log_print_patterns.txt")
     # log(f"识别到 FATAL/ERROR 高风险 TAG 数量: {len(fatal_error_tags)}, {fatal_error_tags}")
 
-    # FILE_STEP_5_ALL_CSV = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_suspicious_analysis_all.csv"
-    # FILE_STEP_6_EXTRACTED = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_extracted_contents.txt"
-    # FILE_STEP_6_OUTPUT_CSV = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_extracted_contents_regex.csv"
-    # FILE_STEP_6_REGEX = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_extracted_contents_regex.txt"
-    #     # --- 第6步：提取并转换为正则 ---
+    # FILE_STEP_5_ALL_CSV = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/media_hal_wrapper/20260513_172208_mediahal_logset/20260513_172208_mediahal_logset_suspicious_analysis_all.csv"
+    # parent_dir = os.path.dirname(FILE_STEP_5_ALL_CSV)
+    # FILE_STEP_6_EXTRACTED = os.path.join(parent_dir, "20260513_172208_mediahal_logset_extracted_contents.txt")
+    # FILE_STEP_6_OUTPUT_CSV = os.path.join(parent_dir, "20260513_172208_mediahal_logset_extracted_contents_regex.csv")
+    # FILE_STEP_6_REGEX = os.path.join(parent_dir, "20260513_172208_mediahal_logset_extracted_contents_regex.txt")
+    # #     # --- 第6步：提取并转换为正则 ---
     # log(f"\n[第6步] 提取分析内容并生成正则到 {FILE_STEP_6_REGEX}...")
     # try:
     #     extract_and_convert_logs.convert_wildcard_logs_to_regex(
@@ -573,11 +587,12 @@ if __name__ == "__main__":
     # except Exception as e:
     #     log(f"第6步失败: {e}")
 
-    # FILE_STEP_7_OUTPUT_CSV = r"/home/amlogic/FAE/AutoLog/lingzhi.bi/extract_module_errlog_and_identitication/code/audio_hal_wrapper/20260513_170018_audiohal_logset/20260513_170018_audiohal_logset_extracted_contents_regex_with_logtag.csv"
+    # FILE_STEP_7_OUTPUT_CSV = os.path.join(parent_dir, "20260513_172208_mediahal_logset_extracted_contents_regex_with_logtag.csv")
+    # FILE_STEP_7_OUTPUT_REGEX_WITH_LOGTAG_TXT = os.path.join(parent_dir, "20260513_172208_mediahal_logset_extracted_contents_regex_with_logtag.txt")
     # # --- 第7步：从源码中提取 LOG_TAG 并写入 CSV 的 logtag 列 ---
     # log(f"\n[第7步] 从源码文件提取 LOG_TAG，并写入 {FILE_STEP_7_OUTPUT_CSV}...")
     # try:
-    #     stats = add_logtag_column_from_source(FILE_STEP_6_OUTPUT_CSV, FILE_STEP_7_OUTPUT_CSV)
+    #     stats = add_logtag_column_from_source(FILE_STEP_6_OUTPUT_CSV, FILE_STEP_7_OUTPUT_CSV, FILE_STEP_7_OUTPUT_REGEX_WITH_LOGTAG_TXT)
     #     log(f"第7步完成: {FILE_STEP_7_OUTPUT_CSV}, stats={stats}")
     # except Exception as e:
     #     log(f"第7步失败: {e}")

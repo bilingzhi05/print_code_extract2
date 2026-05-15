@@ -25,6 +25,7 @@ except ImportError as e:
 OUTPUT_FAIL_FILE = os.path.join(current_dir, "01201605_mediahal_logset_suspicious_analysis_fail.txt")
 INPUT_FILE = os.path.join(current_dir, "01201605_mediahal_logset_deduplicated.txt")
 OUTPUT_FILE = os.path.join(current_dir, "01201605_mediahal_logset_suspicious_analysis.txt")
+OUTPUT_NORMAL_FILE = os.path.join(current_dir, "01201605_mediahal_logset_normal_analysis.csv")
 OLLAMA_URL = "http://10.58.11.60:11434/api/generate"
 MODEL = LLM_MODEL
 BATCH_TOKEN_LIMIT = 512  # Conservative limit to allow space for prompt and response
@@ -52,9 +53,10 @@ def construct_prompt(batch_items):
 
         只要日志语义符合以下任一情况，必须判定为“可疑日志”：
 
-        1. 明确错误或失败
+        1. 明确错误或失败或异常
         - error / ERROR
         - fail / failed / failure
+        - exception / EXCEPTION
 
         2. 隐式失败（即使没有 ERROR 关键字）
         - open / read / write / ioctl / call / get 等系统或驱动操作失败
@@ -184,10 +186,12 @@ def _repair_json_with_format_agent(bad_text: str) -> dict | None:
     fixed = llm_agent.run(prompt) or ""
     return _json_loads_dict_best_effort(fixed)
 
-def _write_batch_result(analysis_result, current_batch, output_file, fail_output_file):
+def parse_batch_result(analysis_result, current_batch, current_batch_check_id, out_fieldnames):
     suspicious_count = 0
+    suspicious_rows = []
+    normal_rows = []
     if not analysis_result:
-        return suspicious_count
+        return suspicious_rows, normal_rows, suspicious_count
 
     def _parse_json_result(raw_text):
         text = (raw_text or "").strip()
@@ -199,9 +203,9 @@ def _write_batch_result(analysis_result, current_batch, output_file, fail_output
     parsed = _parse_json_result(analysis_result)
     if isinstance(parsed, dict):
         suspicious_items = parsed.get("suspicious", [])
-        if not isinstance(suspicious_items, list):
-            suspicious_items = []
-        with open(output_file, 'a', encoding='utf-8') as out_f:
+        normal_items = parsed.get("normal", [])
+
+        if isinstance(suspicious_items, list):
             for item in suspicious_items:
                 if not isinstance(item, dict):
                     continue
@@ -210,46 +214,33 @@ def _write_batch_result(analysis_result, current_batch, output_file, fail_output
                 except Exception:
                     continue
                 reason_part = str(item.get("reason", "未知原因")).strip() or "未知原因"
-                original_log = next((x['line'] for x in current_batch if x['id'] == log_id), None)
-                if original_log:
+                raw_row = next((x["raw_row"] for x in current_batch_check_id if x["id"] == log_id), None)
+                if raw_row:
                     suspicious_count += 1
                     log(f"  [!] 发现可疑日志 ID {log_id}")
-                    out_f.write(f"日志 ID {log_id}:\n")
-                    out_f.write(f"内容: {original_log}\n")
-                    out_f.write(f"分析: {reason_part}\n")
-                    out_f.write("-" * 30 + "\n")
-        return suspicious_count
+                    raw_row_with_reason = dict(raw_row)
+                    raw_row_with_reason["reason"] = reason_part
+                    suspicious_rows.append(raw_row_with_reason)
 
-    # 兼容旧格式输出: SUSPICIOUS_ID: <ID> | REASON: ...
-    with open(output_file, 'a', encoding='utf-8') as out_f:
-        analysis_lines = analysis_result.splitlines()
-        log(f"分析结果行数: {len(analysis_lines)}")
-        for res_line in analysis_lines:
-            res_line = res_line.strip()
-            if res_line.startswith("SUSPICIOUS_ID:"):
+        if isinstance(normal_items, list):
+            for item in normal_items:
+                if not isinstance(item, dict):
+                    continue
                 try:
-                    parts = res_line.split('|', 1)
-                    id_part = parts[0].replace("SUSPICIOUS_ID:", "").strip()
-                    reason_part = parts[1].replace("REASON:", "").strip() if len(parts) > 1 else "未知原因"
-                    log_id = int(id_part)
-                    original_log = next((item['line'] for item in current_batch if item['id'] == log_id), None)
-                    if original_log:
-                        suspicious_count += 1
-                        log(f"  [!] 发现可疑日志 ID {log_id}")
-                        out_f.write(f"日志 ID {log_id}:\n")
-                        out_f.write(f"内容: {original_log}\n")
-                        out_f.write(f"分析: {reason_part}\n")
-                        out_f.write("-" * 30 + "\n")
-                except Exception as parse_e:
-                    log(f"  [x] 解析结果行失败: {res_line} ({parse_e})")
-            else:
-                with open(fail_output_file, 'a', encoding='utf-8') as fail_f:
-                    failed_batch = "\n".join(item['line'] for item in current_batch)
-                    fail_f.write(f"{failed_batch}\n")
-    return suspicious_count
+                    log_id = int(item.get("id"))
+                except Exception:
+                    continue
+                reason_part = str(item.get("reason", "未知原因")).strip() or "未知原因"
+                raw_row = next((x["raw_row"] for x in current_batch_check_id if x["id"] == log_id), None)
+                if raw_row:
+                    raw_row_with_reason = dict(raw_row)
+                    raw_row_with_reason["reason"] = reason_part
+                    normal_rows.append(raw_row_with_reason)
+
+    return suspicious_rows, normal_rows, suspicious_count
 
 
-def extract_suspicious_logs(input_file: str, output_file: str, limit: int = 0, fail_output_file: str = OUTPUT_FAIL_FILE) -> dict:
+def extract_suspicious_logs(input_file: str, output_file: str, output_normal_file: str, limit: int = 0, fail_output_file: str = OUTPUT_FAIL_FILE) -> dict:
     """
     可疑日志提取转换函数：
     从输入日志文件中按批次识别疑似报错日志，并将结果写入输出文件。
@@ -263,12 +254,19 @@ def extract_suspicious_logs(input_file: str, output_file: str, limit: int = 0, f
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"输入文件不存在: {input_file}")
     lines = []
+    out_fieldnames = None
+    fail_fieldnames = None
     with open(input_file, "r", encoding="utf-8", errors="ignore", newline="") as f:
         reader = csv.DictReader(f)
+        fail_fieldnames = list(reader.fieldnames or [])
+        out_fieldnames = list(reader.fieldnames or [])
+        if "reason" not in out_fieldnames:
+            out_fieldnames.append("reason")
         for row in reader:
             text = str((row or {}).get("text", "")).strip()
-            if text:
-                lines.append(text)
+            print_id = int(row.get("id", 0))
+            if text and print_id:
+                lines.append({'id': print_id, 'line': text, "raw_row": row})
 
     total_lines = len(lines)
     log(f"可用日志总行数: {total_lines}")
@@ -281,51 +279,73 @@ def extract_suspicious_logs(input_file: str, output_file: str, limit: int = 0, f
     suspicious_count = 0
     current_batch = []
     current_batch_tokens = 0
+    current_batch_check_id = []
 
-    # 每次运行先清空输出文件
-    open(output_file, "w", encoding="utf-8").close()
-    open(fail_output_file, "w", encoding="utf-8").close()
+    with open(output_file, "w", encoding="utf-8", errors="ignore", newline="") as suspicious_wf, \
+        open(output_normal_file, "w", encoding="utf-8", errors="ignore", newline="") as normal_wf, \
+        open(fail_output_file, "w", encoding="utf-8", errors="ignore", newline="") as fail_wf:
+        suspicious_writer = csv.DictWriter(suspicious_wf, fieldnames=out_fieldnames)
+        normal_writer = csv.DictWriter(normal_wf, fieldnames=out_fieldnames)
+        fail_writer = csv.DictWriter(fail_wf, fieldnames=fail_fieldnames)
+        suspicious_writer.writeheader()
+        normal_writer.writeheader()
+        fail_writer.writeheader()
 
-    for i, line in enumerate(lines):
-        token_count = 0
-        try:
-            with suppress_stdout():
-                token_count = splitter.tokenize(line)
-        except Exception:
+        for i, line in enumerate(lines):
+            token_count = 0
             try:
-                token_count = splitter.tokenize(line)
+                with suppress_stdout():
+                    token_count = splitter.tokenize(line["line"])
             except Exception:
-                token_count = 10
+                try:
+                    token_count = splitter.tokenize(line["line"])
+                except Exception:
+                    token_count = 10
 
-        line_overhead = 10
-        if current_batch and (current_batch_tokens + token_count + line_overhead > BATCH_TOKEN_LIMIT):
-            log(f"正在处理一批日志: {len(current_batch)} 条（约 {current_batch_tokens} tokens）...")
+            line_overhead = 10
+            if current_batch and (current_batch_tokens + token_count + line_overhead > BATCH_TOKEN_LIMIT):
+                log(f"正在处理一批日志: {len(current_batch)} 条（约 {current_batch_tokens} tokens）...")
+                try:
+                    log(f"agent分析一批日志: {current_batch}")
+                    analysis_result = analyze_batch(current_batch)
+                    log(f"分析结果: {analysis_result}")
+                    suspicious_rows, normal_rows, batch_suspicious_count = parse_batch_result(analysis_result, current_batch, current_batch_check_id, out_fieldnames)
+                    suspicious_count += batch_suspicious_count
+                    for row in suspicious_rows:
+                        suspicious_writer.writerow(row)
+                    for row in normal_rows:
+                        normal_writer.writerow(row)
+                except Exception as e:
+                    log(f"当前批次处理失败，已跳过并继续下一批: {e}")
+                    for item in current_batch_check_id:
+                        fail_writer.writerow(item["raw_row"])
+
+                current_batch = []
+                current_batch_tokens = 0
+                current_batch_check_id = []
+            print_id = line["id"]
+            text = line["line"]
+            current_batch.append({"id": print_id, "line": text})
+            current_batch_check_id.append(line)
+            current_batch_tokens += token_count
+
+        if current_batch:
+            log(f"正在处理最后一批日志: {len(current_batch)} 条...")
             try:
+                log(f"agent分析最后一批日志: {current_batch}")
                 analysis_result = analyze_batch(current_batch)
                 log(f"分析结果: {analysis_result}")
-                suspicious_count += _write_batch_result(analysis_result, current_batch, output_file, fail_output_file)
+                suspicious_rows, normal_rows, batch_suspicious_count = parse_batch_result(analysis_result, current_batch, current_batch_check_id, out_fieldnames)
+                suspicious_count += batch_suspicious_count
+                for row in suspicious_rows:
+                    suspicious_writer.writerow(row)
+                for row in normal_rows:
+                    normal_writer.writerow(row)
             except Exception as e:
-                log(f"当前批次处理失败，已跳过并继续下一批: {e}")
-                with open(fail_output_file, 'a', encoding='utf-8') as fail_f:
-                    failed_batch = "\n".join(item['line'] for item in current_batch)
-                    fail_f.write(f"{failed_batch}\n")
-            current_batch = []
-            current_batch_tokens = 0
+                log(f"最后一批处理失败，已记录失败内容: {e}")
+                for item in current_batch_check_id:
+                    fail_writer.writerow(item["raw_row"])
 
-        current_batch.append({'id': i + 1, 'line': line})
-        current_batch_tokens += token_count
-
-    if current_batch:
-        log(f"正在处理最后一批日志: {len(current_batch)} 条...")
-        try:
-            analysis_result = analyze_batch(current_batch)
-            log(f"分析结果: {analysis_result}")
-            suspicious_count += _write_batch_result(analysis_result, current_batch, output_file, fail_output_file)
-        except Exception as e:
-            log(f"最后一批处理失败，已记录失败内容: {e}")
-            with open(fail_output_file, 'a', encoding='utf-8') as fail_f:
-                failed_batch = "\n".join(item['line'] for item in current_batch)
-                fail_f.write(f"{failed_batch}\n")
 
     duration = time.time() - start_time
     log(f"\n\n批量分析完成，耗时 {duration:.2f} 秒。")
@@ -333,9 +353,9 @@ def extract_suspicious_logs(input_file: str, output_file: str, limit: int = 0, f
     log(f"发现可疑日志数: {suspicious_count}")
     log(f"结果已保存到: {output_file}")
     return {
-        "input_file": input_file,
-        "output_file": output_file,
-        "fail_output_file": fail_output_file,
+        "input_csv_file": input_file,
+        "output_csv_file": output_file,
+        "fail_output_csv_file": fail_output_file,
         "processed_lines": len(lines),
         "suspicious_count": suspicious_count,
         "duration_seconds": round(duration, 2),
@@ -346,17 +366,20 @@ def main():
     parser = argparse.ArgumentParser(description="使用 Ollama 批量识别可疑日志。")
     parser.add_argument("--input", type=str, default=INPUT_FILE, help="输入日志文件路径")
     parser.add_argument("--output", type=str, default=OUTPUT_FILE, help="输出结果文件路径")
+    parser.add_argument("--output-normal", type=str, default=OUTPUT_NORMAL_FILE, help="输出 normal 结果 CSV 路径")
     parser.add_argument("--limit", type=int, default=0, help="限制处理的日志行数")
     args = parser.parse_args()
-
+    input = ""
     try:
-        extract_suspicious_logs(args.input, args.output, args.limit, OUTPUT_FAIL_FILE)
+        extract_suspicious_logs(args.input, args.output, args.output_normal, args.limit, OUTPUT_FAIL_FILE)
     except Exception as e:
         log(str(e))
 
 if __name__ == "__main__":
     # main()
-    prompt = """
+    input = [{'id': 4013, 'line': 'EXIT PLAYBACK.'}, {'id': 4014, 'line': 'Audio is ready to start,hold time :%d us !'}, {'id': 4017, 'line': 'audioNeedHold:%d curPcrPtsDiff:%'}, {'id': 4019, 'line': 'needDrop cur_apts:%'}, {'id': 4020, 'line': 'Audio FreeRun: cur_apts:%'}, {'id': 4021, 'line': 'Audio FreeRun: audioPolicy:%s,state:%d, diff:%'}, {'id': 4024, 'line': 'video jump'}, {'id': 4025, 'line': 'pv diff is large, enter slow play sync.'}, {'id': 4026, 'line': 'Video back to sync, leave slow play sync.'}, {'id': 4027, 'line': 'mVideoLatency(ms) changed:%d -> %d'}, {'id': 4028, 'line': 'pv-diff:%'}, {'id': 4029, 'line': 'curPcr:%'}, {'id': 4030, 'line': 'exception:vpts jump back %'}, {'id': 4031, 'line': 'exception:[p-add:%'}, {'id': 4033, 'line': 'video frame comes later:%'}, {'id': 4034, 'line': 'video only free run.'}, {'id': 4035, 'line': 'discontinue vpts jump back actualVpts:0x %'}, {'id': 4036, 'line': 'video free run. mVideoFreeRun:%d'}, {'id': 4037, 'line': 'mVideoFreeRun 1-->0'}, {'id': 4038, 'line': 'micro speed --> normal, update refclock.'}, {'id': 4039, 'line': 'mSlowSyncRealPVdiff=%'}, {'id': 4040, 'line': 'ExpectAvSyncDoneTimeUS is less than mSlowSyncRealPVdiffUs, close slowsync!'}, {'id': 4041, 'line': 'SlowSyncThreshold:%d ms AvSyncDoneDuration:%'}, {'id': 4042, 'line': '[AUT_PRINT] SlowSync Start!'}, {'id': 4043, 'line': '[AUT_PRINT] VIDEO START directly due to slowsync!'}, {'id': 4044, 'line': '[AUT_PRINT] No SlowSync!'}, {'id': 4045, 'line': '[AUT_PRINT] VIDEO START directly due to diff is large!'}, {'id': 4047, 'line': '[AUT_PRINT] VIDEO START!'}, {'id': 4048, 'line': 'checkVPtsValid failed:%'}, {'id': 4049, 'line': 'Ionly mode vpts:%'}, {'id': 4050, 'line': 'vpts:%'}, {'id': 4051, 'line': 'setResumePlayMode MEDIASYNC_STATUS_VIDEO_DONE'}, {'id': 4052, 'line': 'SHOW FIRST FRAME NOSYNC in VIDEO_TRICK_MODE_PAUSE_NEXT, [real:%'}, {'id': 4054, 'line': '[AUT_PRINT] first vpts:%'}, {'id': 4055, 'line': 'SHOW FIRST FRAME NOSYNC, [real:%'}, {'id': 4056, 'line': 'first vpts invalid ,render'}, {'id': 4057, 'line': 'first vpts invalid ,drop'}, {'id': 4058, 'line': 'SHOW FIRST FRAME NOSYNC 2, [real:%'}, {'id': 4060, 'line': 'start apts jump back, need drop video, curvpts:%'}, {'id': 4061, 'line': 'Video is ready to start! holdtime:%d (us)'}, {'id': 4062, 'line': '(%s) videoNeedHold:%d PcrPtsDiff:%'}, {'id': 4064, 'line': 'VideoHoldTime: %'}, {'id': 4065, 'line': 'vptsIncrease:%'}, {'id': 4066, 'line': 'needDropButDisplay realshowtime:%'}, {'id': 4067, 'line': 'test [%'}, {'id': 4069, 'line': 'realtime:%'}, {'id': 4070, 'line': 'cur_vpts:%'}, {'id': 4072, 'line': 'firstNormalOut vpts:%'}, {'id': 4073, 'line': 'Interlaced stream!'}, {'id': 4074, 'line': '[actualVpts:%'}, {'id': 4075, 'line': '[pv_diff:%'}, {'id': 4076, 'line': 'Done [actualVpts:%'}, {'id': 4078, 'line': '[AUT_PRINT] SlowSync Finished.'}, {'id': 4079, 'line': '[actualVptsPcrDiff:%'}, {'id': 4080, 'line': 'jump detected, start slow sync.curSystime:%'}, {'id': 4081, 'line': '[AUT_PRINT] During SlowSync Finished.'}, {'id': 4083, 'line': 'mExternalUpdateCount:%d'}]
+    json_input = json.dumps(input, ensure_ascii=False, indent=4)
+    prompt = f"""
                你是一名【资深系统 / 多媒体 / 驱动层日志分析专家】。
 
         我将提供一批日志，每条日志都有唯一的 ID。
@@ -368,9 +391,10 @@ if __name__ == "__main__":
 
         只要日志语义符合以下任一情况，必须判定为“可疑日志”：
 
-        1. 明确错误或失败
+        1. 明确错误或失败或异常
         - error / ERROR
         - fail / failed / failure
+        - exception / EXCEPTION
 
         2. 隐式失败（即使没有 ERROR 关键字）
         - open / read / write / ioctl / call / get 等系统或驱动操作失败
@@ -417,102 +441,7 @@ if __name__ == "__main__":
         - 无后果的普通提示或已恢复警告
         
         Logs:
-        ID:801 | LOG:kWhatStopAudio mAdSoftWrap.clear()
-ID:802 | LOG:kWhatStopAudio mAdSoftWrap = NULL
-ID:803 | LOG:kWhatStopAudio mAdAdecWrap->Stop()
-ID:804 | LOG:kWhatStopAudio mAdAdecWrap->Release()
-ID:805 | LOG:kWhatStopAudio mAdAdecWrap.clear()
-ID:806 | LOG:kWhatStopAudio mAdAdecWrap = NULL
-ID:807 | LOG:kWhatStopVideo mDemuxWrap.AmDemuxWrapperStop(vpid:0x%x)
-ID:808 | LOG:kWhatUpdateAudioStatus auio_change ch=%u ch_mask=%u samp=%u
-ID:809 | LOG:kWhatUpdateHandlerStatus first get CheckinVpts:%
-ID:810 | LOG:kWhatUpdateHandlerStatus  get CheckinVpts:%
-ID:811 | LOG:DATA_LOSS mLastCheckinVpts:%
-ID:812 | LOG:DATA_RESUME
-ID:813 | LOG:DECODER_DATA_LOSS mLastFrameCount:%d dqbufFailCount:%d mVideoEsInvalid:%d
-ID:814 | LOG:DECODER_DATA_RESUME
-ID:815 | LOG:kWhatUpdateHandlerStatus first get checkinApts:%
-ID:816 | LOG:kWhatUpdateHandlerStatus get checkinApts:%
-ID:817 | LOG:DATA_LOSS mLastCheckinApts:%
-ID:818 | LOG:DECODER_DATA_LOSS mLastCheckoutApts:%
-ID:819 | LOG:pause find stream_type : %d
-ID:820 | LOG:pause in ,stream_type: %d
-ID:821 | LOG:mVdNonTunnelMode->Pause() finished
-ID:822 | LOG:pause finished
-ID:823 | LOG:pause out ,stream_type: %d
-ID:824 | LOG:resume find stream_type : %d
-ID:825 | LOG:resume in ,stream_type: %d
-ID:826 | LOG:mVdNonTunnelMode->Resume finished
-ID:827 | LOG:resume finished
-ID:828 | LOG:resume out ,stream_type: %d
-ID:829 | LOG:type %d fmt %d
-ID:830 | LOG:UnsupportedFormat format: %s
-ID:831 | LOG:USERDATA param nullptr
-ID:832 | LOG:VIDEO FORMAT CHANGED [%d x %d] @%d aspectratio:%d
-ID:833 | LOG:VIDEO FORMAT param %p, paramsize %d
-ID:834 | LOG:AUDIO FORMAT CHANGED ch=%u ch_mask=%u samplerate=%u
-ID:835 | LOG:AUDIO FORMAT param %p, paramsize %d
-ID:836 | LOG:event type: %s
-ID:837 | LOG:isStopVideo:%d,display first video
-ID:838 | LOG:isStopVideo:%d,decodec first video
-ID:839 | LOG:mStopAudio:%d,decodec first audio
-ID:840 | LOG:isStopVideo:%d,mStopAudio:%d,av sync done!
-ID:841 | LOG:isStopVideo:%d,frame error count callback
-ID:842 | LOG:isStopVideo:%d,video unsupport
-ID:843 | LOG:instance was preempted!
-ID:844 | LOG:hasdtvvideo:%d mStopVideo:%d mStopAudio:%d. decoder started!
-ID:845 | LOG:FFFB VIDEO TIMESTAMP param %p, paramsize %d
-ID:846 | LOG:Reset playback pipeline!
-ID:847 | LOG:dmx:%p
-ID:848 | LOG:audio pid: %#x
-ID:849 | LOG:EsDataHandler SetVideoLoopEnable:%d
-ID:850 | LOG:EsDataHandler
-ID:851 | LOG:Not get %s pts info, set cache to %dms
-ID:852 | LOG:Update video cache duration: %d ms
-ID:853 | LOG:EsDataHandler ReadBuffer Video Stop!!
-ID:854 | LOG:mEsdata->size == 0
-ID:855 | LOG:Audio write VDA_RETRY
-ID:856 | LOG:Audio write to amadec VDA_RETRY
-ID:857 | LOG:EsDataHandler ReadBuffer Audio Stop!!
-ID:858 | LOG:input parameter was NULL, init_stb_trace failed!
-ID:859 | LOG:input parameter was NULL, stb_trace_dbg failed!
-ID:860 | LOG:[%s][%d] step: No-%d %s, time: %u, consume: %u
-ID:861 | LOG:input parameter was NULL, AmTsPlayer_getPropertyInt failed!
-ID:862 | LOG:input parameter was NULL, AmTsPlayer_propertyGet failed!
-ID:863 | LOG:Unregistering stale handler %d
-ID:864 | LOG:blackout:%d
-ID:865 | LOG:release mVideoDecNonTunneLooper.clear
-ID:866 | LOG:in mode:%d vid:%d
-ID:867 | LOG:[No-%d](%p) %s start
-ID:868 | LOG:[No-%d](%p) %s report video stuck event
-ID:869 | LOG:[No-%d](%p) %s return
-ID:870 | LOG:mRender == NULL
-ID:871 | LOG:in OnFlush mQueuedSlot.size():%d
-ID:872 | LOG:mVPid:0x%x mVideoMime:%s
-ID:873 | LOG:mState == STOPPED return
-ID:874 | LOG:mDisplay.reset %p
-ID:875 | LOG:---->Render first frame mediaTimeUs:%
-ID:876 | LOG:---->Render Av Sync Done !
-ID:877 | LOG:kWhatQueueOutPutNotify NoFind,timestampNs(%
-ID:878 | LOG:kWhatStop mState:%d return
-ID:879 | LOG:kWhatStop onStop
-ID:880 | LOG:kWhatFlush vpid:%d
-ID:881 | LOG:kWhatFlush mState:%d, mNeedFlush:%d
-ID:882 | LOG:mVideoMime:%s, single demux only audio
-ID:883 | LOG:mVideoMime:%s, size > 64!
-ID:884 | LOG:not mInit
-ID:885 | LOG:return not STARTED(%d) mState:%d
-ID:886 | LOG:bufnum %d, width %d, height %d,mDqWidth:%d,mDqHeight:%d
-ID:887 | LOG:RequestBuffer, slot:%d is null
-ID:888 | LOG:createOutputBuffer slot:%d i:%d
-ID:889 | LOG:createOutputBuffer slot:%d to surface!i:%d
-ID:890 | LOG:createOutputBuffer slot:%d decode!i:%d
-ID:891 | LOG:can not find bitstreamId %d
-ID:892 | LOG:RegisterCb pFunc:%p disPlayHandle:%p
-ID:893 | LOG:info %p, size %d
-ID:894 | LOG:error %d
-ID:895 | LOG:VIDEO FORMAT CHANGED [%d x %d] @%d fps
-ID:896 | LOG:pthread_create ok DequeueDisPlayerBufferThread:%ld
+        {json_input} 
 
         ====================
         【三、输出格式（严格要求）】

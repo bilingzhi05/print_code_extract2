@@ -36,12 +36,13 @@ def extract_patterns(log_print_file):
 
     return patterns
 
-def run_grep(log_print_file, source_path):
+def run_grep(log_print_file, source_path, source_exts={".c", ".cpp", ".h"}):
+
     """
     优先使用高性能命令行工具扫描源码（rg/grep），失败时回退到 Python 扫描。
     输出格式统一为 file:line:text
     """
-    source_exts = {".c", ".cpp", ".java"}
+    
     target_source_path = os.path.abspath(source_path)
 
     rg_bin = shutil.which("rg")
@@ -49,7 +50,10 @@ def run_grep(log_print_file, source_path):
         if os.path.isfile(target_source_path):
             cmd = [rg_bin, "-n", "-i", "log", target_source_path]
         else:
-            cmd = [rg_bin, "-n", "-i", "log", target_source_path, "-g", "*.c", "-g", "*.cpp", "-g", "*.java"]
+            cmd = [rg_bin, "-n", "-i", "log", target_source_path]
+            for ext in source_exts:
+                # e.g., ".c" -> "*.c"
+                cmd.extend(["-g", f"*{ext}"])
         log(f"使用 rg 扫描: {' '.join(cmd)}")
         with open(log_print_file, "w", encoding="utf-8") as out:
             result = subprocess.run(cmd, stdout=out, stderr=subprocess.PIPE, text=True)
@@ -68,10 +72,9 @@ def run_grep(log_print_file, source_path):
                 "-nir",
                 "log",
                 target_source_path,
-                "--include=*.c",
-                "--include=*.cpp",
-                "--include=*.java",
             ]
+            for ext in source_exts:
+                cmd.append(f"--include=*{ext}")
         log(f"使用 grep 扫描: {' '.join(cmd)}")
         with open(log_print_file, "w", encoding="utf-8") as out:
             result = subprocess.run(cmd, stdout=out, stderr=subprocess.PIPE, text=True)
@@ -109,11 +112,11 @@ def run_grep(log_print_file, source_path):
     log(f"Python 扫描完成，命中 {hit_count} 行，输出到 {log_print_file}")
 
 
-def extract_log_print_patterns_to_file(source_path=None):
-    target_source_path = source_path or SOURCE_DIR
+def extract_log_print_patterns_to_file(source_path=None, source_exts=None):
+    target_source_path = source_path
     current_dir = os.path.dirname(os.path.abspath(target_source_path))
     log_print_file = os.path.join(current_dir, "log_print.txt")
-    run_grep(log_print_file, target_source_path)
+    run_grep(log_print_file, target_source_path, source_exts=source_exts)
     patterns = extract_patterns(log_print_file)
     
     if not patterns:

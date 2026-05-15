@@ -61,10 +61,9 @@ def build_patterns(pattern_file=None):
         starters[n] = re.compile(r"\b" + n + r"\s*\(", re.IGNORECASE)
     return compiled, starters
 
-def is_source_file(path):
-    exts = {".c", ".cc", ".cpp", ".h", ".hpp", ".cxx"}
+def is_source_file(path, source_exts=None):
     _, ext = os.path.splitext(path)
-    return ext.lower() in exts
+    return ext.lower() in source_exts
 
 def should_skip_line(line):
     s = line.lstrip()
@@ -186,12 +185,12 @@ def scan_file(path, patterns, starters):
         pass
     return results
 
-def walk_root(root, patterns, starters):
+def walk_root(root, patterns, starters, source_exts=None):
     all_results = []
     for dirpath, dirnames, filenames in os.walk(root):
         for fn in filenames:
             fp = os.path.join(dirpath, fn)
-            if is_source_file(fp):
+            if is_source_file(fp, source_exts=source_exts):
                 res = scan_file(fp, patterns, starters)
                 if res:
                     all_results.extend(res)
@@ -204,13 +203,13 @@ def write_output(out_path, rows, fmt):
         if fmt == "csv":
             with open(out_path, "w", newline="") as w:
                 writer = csv.writer(w)
-                writer.writerow(["file", "line", "style", "text"])
-                for r in rows:
-                    writer.writerow([r[0], r[1], r[2], r[3]])
+                writer.writerow(["id", "file", "line", "style", "text"])
+                for i, r in enumerate(rows):
+                    writer.writerow([i, r[0], r[1], r[2], r[3]])
         else:
             with open(out_path, "w") as w:
-                for r in rows:
-                    w.write(f"{r[0]}:{r[1]}\t{r[2]}\t{r[3]}\n")
+                for i, r in enumerate(rows):
+                    w.write(f"{i}:{r[0]}:{r[1]}\t{r[2]}\t{r[3]}\n")
     except Exception as e:
         sys.stderr.write(str(e) + "\n")
 
